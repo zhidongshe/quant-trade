@@ -34,42 +34,46 @@ def init(ContextInfo):
     ContextInfo.capital = 1000000  # 回测初始资金100万
 
     # 持仓状态字典: {stockcode: Position}
-    # 使用ContextInfo存储，保证跨bar持久化
     ContextInfo.positions = {}
 
-    # 当日已处理标志（日线策略，每个交易日只执行一次交易逻辑）
+    # 当日已处理标志
     ContextInfo.last_trade_date = None
+
+    # 在init中预设universe，消除第一个bar的数据延迟
+    universe = ContextInfo.get_sector('000300.SH')
+    if universe:
+        ContextInfo.set_universe(universe)
 
 
 def handlebar(ContextInfo):
     """核心执行函数，每根K线调用一次"""
-    # 只在最后一根K线执行（避免盘中反复计算）
-    if not ContextInfo.is_last_bar():
-        return
-
-    # 获取当前日期
     current_date = timetag_to_datetime(ContextInfo.get_bar_timetag(ContextInfo.barpos), '%Y%m%d')
 
-    # 日线策略：每个交易日只执行一次
     if ContextInfo.last_trade_date == current_date:
         return
     ContextInfo.last_trade_date = current_date
 
+    holdings = list(ContextInfo.positions.keys())
+    print("[{0}] ===== 持仓: {1}只 {2} =====".format(current_date, len(holdings), holdings))
+
     # 1. 更新股票池（沪深300成分股）
     universe = ContextInfo.get_sector('000300.SH')
     if not universe:
-        print(f"[{current_date}] 警告: 无法获取沪深300成分股")
+        print("[{0}] 警告: 无法获取沪深300成分股".format(current_date))
         return
-    ContextInfo.set_universe(universe)
 
-    # 过滤ST股
-    universe = _filter_st_stocks(universe, ContextInfo)
+    # 将持仓股票加入universe（提前设置，下一个bar就能获取数据）
+    held_stocks = list(ContextInfo.positions.keys())
+    full_universe = list(set(universe + held_stocks))
+    ContextInfo.set_universe(full_universe)
+
+    # 过滤ST股（只过滤买入池，不影响卖出）
+    buy_universe = _filter_st_stocks(universe, ContextInfo)
 
     # 2. 获取账户信息（实盘/模拟）
     account_id = ContextInfo.accountid if hasattr(ContextInfo, 'accountid') else ''
     account_type = 'STOCK'
 
-    # 获取可用资金
     available_cash = ContextInfo.capital
     if account_id:
         acct_info = get_trade_detail_data(account_id, account_type, 'ACCOUNT')
@@ -78,40 +82,47 @@ def handlebar(ContextInfo):
 
     # 3. 遍历现有持仓，检查止损/止盈
     positions_to_sell = []
-    for stockcode, pos in list(ContextInfo.positions.items()):
-        # 获取当前价格
-        current_data = ContextInfo.get_market_data(['close'], [stockcode], period='1d', count=1)
-        if current_data is None or stockcode not in current_data:
-            continue
-        current_price = current_data[stockcode]['close'].values[-1]
-
-        # 获取20日均线
+    if len(ContextInfo.positions) > 0:
         hist_prices = ContextInfo.get_history_data(25, '1d', 'close', dividend_type='front', skip_paused=True)
-        if stockcode not in hist_prices or len(hist_prices[stockcode]) < 20:
-            continue
-        prices_arr = np.array(hist_prices[stockcode])
-        ma20 = np.mean(prices_arr[-20:])
 
-        # 检查三个卖出条件
-        should_sell = False
-        sell_reason = ''
+        for stockcode, pos in list(ContextInfo.positions.items()):
+            if stockcode not in hist_prices or len(hist_prices[stockcode]) < 1:
+                print("[{0}] {1} 跳过卖出: 无数据".format(current_date, stockcode))
+                continue
 
-        if check_stop_loss(pos, current_price, HARD_STOP_PCT):
-            should_sell = True
-            sell_reason = 'hard_stop'
-        elif check_trend_break(current_price, ma20):
-            should_sell = True
-            sell_reason = 'trend_break'
-        elif check_trailing_stop(pos, current_price, PROFIT_THRESHOLD, TRAILING_PULLBACK_PCT):
-            should_sell = True
-            sell_reason = 'trailing_stop'
+            prices_list = hist_prices[stockcode]
+            current_price = float(prices_list[-1])
 
-        if should_sell:
-            positions_to_sell.append((stockcode, sell_reason))
+            if current_price > pos.highest_price:
+                pos.highest_price = current_price
+
+            if len(prices_list) < 20:
+                if check_stop_loss(pos, current_price, HARD_STOP_PCT):
+                    positions_to_sell.append((stockcode, 'hard_stop'))
+                continue
+
+            prices_arr = np.array(prices_list)
+            ma20 = np.mean(prices_arr[-20:])
+
+            should_sell = False
+            sell_reason = ''
+
+            if check_stop_loss(pos, current_price, HARD_STOP_PCT):
+                should_sell = True
+                sell_reason = 'hard_stop'
+            elif check_trend_break(current_price, ma20):
+                should_sell = True
+                sell_reason = 'trend_break'
+            elif check_trailing_stop(pos, current_price, PROFIT_THRESHOLD, TRAILING_PULLBACK_PCT):
+                should_sell = True
+                sell_reason = 'trailing_stop'
+
+            if should_sell:
+                positions_to_sell.append((stockcode, sell_reason))
 
     # 执行卖出
     for stockcode, reason in positions_to_sell:
-        _execute_sell(ContextInfo, account_id, account_type, stockcode, reason)
+        _execute_sell(ContextInfo, account_id, account_type, stockcode, reason, current_date)
         if stockcode in ContextInfo.positions:
             del ContextInfo.positions[stockcode]
 
@@ -121,20 +132,18 @@ def handlebar(ContextInfo):
         _log_status(ContextInfo, current_date)
         return
 
-    # 获取可用资金（卖出后可能增加了）
     if account_id:
         acct_info = get_trade_detail_data(account_id, account_type, 'ACCOUNT')
         if acct_info:
             available_cash = acct_info[0].m_dAvailable
 
-    for stockcode in universe:
-        # 已持仓的不重复买入
+    # 一次性获取所有universe的历史数据
+    hist_prices = ContextInfo.get_history_data(70, '1d', 'close', dividend_type='front', skip_paused=True)
+    hist_volumes = ContextInfo.get_history_data(25, '1d', 'volume', dividend_type='front', skip_paused=True)
+
+    for stockcode in buy_universe:
         if stockcode in ContextInfo.positions:
             continue
-
-        # 获取历史数据
-        hist_prices = ContextInfo.get_history_data(70, '1d', 'close', dividend_type='front', skip_paused=True)
-        hist_volumes = ContextInfo.get_history_data(25, '1d', 'volume', dividend_type='front', skip_paused=True)
 
         if stockcode not in hist_prices or len(hist_prices[stockcode]) < 70:
             continue
@@ -144,25 +153,25 @@ def handlebar(ContextInfo):
         prices_arr = np.array(hist_prices[stockcode])
         volumes_arr = np.array(hist_volumes[stockcode])
 
-        # 检查买入信号
         if check_buy_signal(prices_arr, volumes_arr):
-            # 计算买入金额
             buy_amount = calculate_buy_amount(ContextInfo.capital, available_cash, MAX_POSITIONS)
-            if buy_amount < 1000:  # 最小买入金额
+            if buy_amount < 1000:
                 continue
 
-            # 执行买入
-            success = _execute_buy(ContextInfo, account_id, account_type, stockcode, buy_amount)
+            current_price = prices_arr[-1]
+            buy_volume = int(buy_amount / current_price / 100) * 100
+            if buy_volume < 100:
+                continue
+
+            success = _execute_buy(ContextInfo, account_id, account_type, stockcode, buy_volume, current_price, current_date)
             if success:
-                # 记录持仓
-                current_price = prices_arr[-1]
                 ContextInfo.positions[stockcode] = Position(
                     stockcode=stockcode,
                     buy_price=current_price,
                     buy_date=current_date,
-                    volume=0  # QMT中通过get_trade_detail_data查询实际成交
+                    volume=buy_volume
                 )
-                available_cash -= buy_amount
+                available_cash -= buy_volume * current_price
                 current_holdings += 1
 
                 if current_holdings >= MAX_POSITIONS:
@@ -188,50 +197,57 @@ def _filter_st_stocks(universe, ContextInfo):
     return filtered
 
 
-def _execute_buy(ContextInfo, account_id, account_type, stockcode, amount):
-    """执行买入"""
+def _execute_buy(ContextInfo, account_id, account_type, stockcode, volume, price, trade_date):
+    """执行买入（按股数下单）"""
     try:
         passorder(
             23,  # 买入
-            1102,  # 按金额
+            1101,  # 按股数
             account_id,
             stockcode,
-            0,  # 最新价
-            -1,
-            amount,
-            ContextInfo,
-            'hs300_trend_strategy',
-            1  # quickTrade=1，立即触发
+            5,  # 最新价
+            -1.0,
+            float(volume),
+            ContextInfo
         )
-        print(f"买入信号: {stockcode}, 金额: {amount}")
+        print("[{0}] 买入: {1}, 数量: {2}股, 价格: {3:.2f}".format(trade_date, stockcode, volume, price))
         return True
     except Exception as e:
-        print(f"买入失败 {stockcode}: {e}")
+        print("[{0}] 买入失败 {1}: {2}".format(trade_date, stockcode, e))
         return False
 
 
-def _execute_sell(ContextInfo, account_id, account_type, stockcode, reason):
-    """执行卖出"""
+def _execute_sell(ContextInfo, account_id, account_type, stockcode, reason, trade_date):
+    """执行卖出（按股数下单）"""
     try:
+        sell_volume = 0
+        if stockcode in ContextInfo.positions:
+            sell_volume = ContextInfo.positions[stockcode].volume
+
+        if sell_volume <= 0:
+            pos = ContextInfo.positions.get(stockcode)
+            if pos:
+                sell_volume = int(200000 / pos.buy_price / 100) * 100
+
+        if sell_volume <= 0:
+            sell_volume = 100
+
         passorder(
             24,  # 卖出
             1101,  # 按股数
             account_id,
             stockcode,
-            0,  # 最新价
-            -1,
-            -1,  # 全仓卖出
-            ContextInfo,
-            'hs300_trend_strategy',
-            1  # quickTrade=1
+            5,  # 最新价
+            -1.0,
+            float(sell_volume),
+            ContextInfo
         )
-        print(f"卖出信号: {stockcode}, 原因: {reason}")
+        print("[{0}] 卖出: {1}, 数量: {2}股, 原因: {3}".format(trade_date, stockcode, sell_volume, reason))
     except Exception as e:
-        print(f"卖出失败 {stockcode}: {e}")
+        print("[{0}] 卖出失败 {1}: {2}".format(trade_date, stockcode, e))
 
 
 def _log_status(ContextInfo, current_date):
     """输出当前持仓状态"""
     holdings = list(ContextInfo.positions.keys())
-    log_msg = f"[{current_date}] 当前持仓({len(holdings)}只): {holdings}"
-    print(log_msg)
+    print("[{0}] 当前持仓({1}只): {2}".format(current_date, len(holdings), holdings))
