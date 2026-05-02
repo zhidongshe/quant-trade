@@ -289,12 +289,23 @@ def handlebar(ContextInfo):
         hist_prices = ContextInfo.get_history_data(25, '1d', 'close', dividend_type='front', skip_paused=True)
 
         for stockcode, pos in list(ContextInfo.positions.items()):
-            if stockcode not in hist_prices or len(hist_prices[stockcode]) < 1:
+            prices_list = hist_prices.get(stockcode, [])
+            current_price = None
+
+            if len(prices_list) >= 1:
+                current_price = float(prices_list[-1])
+            else:
+                # get_history_data 无数据时，尝试用 get_market_data 兜底获取当前价
+                try:
+                    md = ContextInfo.get_market_data(['close'], [stockcode], period='1d', count=1)
+                    if md is not None and stockcode in md:
+                        current_price = float(md[stockcode]['close'].values[-1])
+                except Exception:
+                    pass
+
+            if current_price is None:
                 _log("[{0}] {1} 跳过卖出: 无数据".format(current_date, stockcode))
                 continue
-
-            prices_list = hist_prices[stockcode]
-            current_price = float(prices_list[-1])
 
             # 更新highest_price用于跟踪止盈
             if current_price > pos.highest_price:
@@ -471,6 +482,12 @@ def handlebar(ContextInfo):
                     current_holdings += 1
 
     _log_status(ContextInfo, current_date)
+
+    # 买入/换仓后 positions 可能多了新代码：再 set_universe 一次，减轻下一根 K 取数滞后。
+    # 禁止在此处再次 get_sector：同 bar 内第二次 get_sector 在部分 QMT 版本会返回 [] 或干扰后续 bar，表现为股票池变空。
+    held_after_trade = list(ContextInfo.positions.keys())
+    full_universe = list(set(universe + held_after_trade))
+    ContextInfo.set_universe(full_universe)
 
 
 def _filter_st_stocks(universe, ContextInfo):
