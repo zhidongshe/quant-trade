@@ -472,14 +472,6 @@ def handlebar(ContextInfo):
 
     _log_status(ContextInfo, current_date)
 
-    # 再次更新universe，确保下一bar能获取新持仓的数据
-    # (set_universe有1bar延迟，买入后补调一次，避免新持仓隔天才能拿到数据)
-    universe = ContextInfo.get_sector('000300.SH')
-    if universe:
-        held_stocks = list(ContextInfo.positions.keys())
-        full_universe = list(set(universe + held_stocks))
-        ContextInfo.set_universe(full_universe)
-
 
 def _filter_st_stocks(universe, ContextInfo):
     filtered = []
