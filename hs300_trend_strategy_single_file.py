@@ -16,6 +16,21 @@
 """
 
 import numpy as np
+import os
+
+# ==================== 日志模块 ====================
+
+_LOG_FILE_PATH = r'c:\量化日志.log'
+
+
+def _log(msg):
+    """同时输出到终端和日志文件"""
+    print(msg)
+    try:
+        with open(_LOG_FILE_PATH, 'a', encoding='gbk') as f:
+            f.write(msg + '\n')
+    except Exception:
+        pass
 
 
 # ==================== 指标计算模块 ====================
@@ -198,7 +213,7 @@ def _sync_positions(ContextInfo, account_id, account_type, current_date):
             raw_code = p.m_strInstrumentID
             code = _normalize_stock_code(raw_code)
             if code != raw_code:
-                print("[{0}] 代码标准化: {1} → {2}".format(current_date, raw_code, code))
+                _log("[{0}] 代码标准化: {1} → {2}".format(current_date, raw_code, code))
             vol = int(p.m_nVolume) if hasattr(p, 'm_nVolume') else int(p.m_nCanUseVolume)
             if vol > 0:
                 qmt_holdings[code] = {
@@ -215,16 +230,16 @@ def _sync_positions(ContextInfo, account_id, account_type, current_date):
                     buy_date=current_date,
                     volume=info['volume']
                 )
-                print("[{0}] 同步持仓: {1}, 数量{2}股".format(current_date, code, info['volume']))
+                _log("[{0}] 同步持仓: {1}, 数量{2}股".format(current_date, code, info['volume']))
 
         # 我们有但QMT已经没有的 → 清除
         for code in list(ContextInfo.positions.keys()):
             if code not in qmt_holdings:
-                print("[{0}] 清除失效持仓: {1}".format(current_date, code))
+                _log("[{0}] 清除失效持仓: {1}".format(current_date, code))
                 del ContextInfo.positions[code]
 
     except Exception as e:
-        print("[{0}] 持仓同步异常: {1}".format(current_date, e))
+        _log("[{0}] 持仓同步异常: {1}".format(current_date, e))
 
 
 def handlebar(ContextInfo):
@@ -239,7 +254,7 @@ def handlebar(ContextInfo):
     _sync_positions(ContextInfo, account_id, 'STOCK', current_date)
 
     holdings = list(ContextInfo.positions.keys())
-    print("[{0}] ===== 日期: {0} | 持仓: {1}只 | 距下次换仓: {2}个交易日 =====".format(
+    _log("[{0}] ===== 日期: {0} | 持仓: {1}只 | 距下次换仓: {2}个交易日 =====".format(
         current_date, len(holdings),
         REBALANCE_INTERVAL - getattr(ContextInfo, 'rebalance_count', 0)
     ))
@@ -247,7 +262,7 @@ def handlebar(ContextInfo):
     # 1. 更新股票池
     universe = ContextInfo.get_sector('000300.SH')
     if not universe:
-        print("[{0}] 警告: 无法获取沪深300成分股".format(current_date))
+        _log("[{0}] 警告: 无法获取沪深300成分股".format(current_date))
         return
 
     # 将持仓股票加入universe（提前设置，下一个bar就能获取数据）
@@ -275,7 +290,7 @@ def handlebar(ContextInfo):
 
         for stockcode, pos in list(ContextInfo.positions.items()):
             if stockcode not in hist_prices or len(hist_prices[stockcode]) < 1:
-                print("[{0}] {1} 跳过卖出: 无数据".format(current_date, stockcode))
+                _log("[{0}] {1} 跳过卖出: 无数据".format(current_date, stockcode))
                 continue
 
             prices_list = hist_prices[stockcode]
@@ -309,7 +324,7 @@ def handlebar(ContextInfo):
 
             if should_sell:
                 pnl_pct = (current_price - pos.buy_price) / pos.buy_price * 100
-                print("[{0}] 触发卖出: {1} | 原因: {2} | 买入价: {3:.2f} | 现价: {4:.2f} | 盈亏: {5:+.2f}%".format(
+                _log("[{0}] 触发卖出: {1} | 原因: {2} | 买入价: {3:.2f} | 现价: {4:.2f} | 盈亏: {5:+.2f}%".format(
                     current_date, stockcode, sell_reason, pos.buy_price, current_price, pnl_pct))
                 positions_to_sell.append((stockcode, sell_reason))
 
@@ -354,15 +369,15 @@ def handlebar(ContextInfo):
         top_codes = [x[0] for x in top_n]
         ContextInfo.ranked_candidates = scored
 
-        print("[{0}] ====== 换仓日 ======".format(current_date))
-        print("[{0}] 打分候选: {1}只通过四因子".format(current_date, len(scored)))
+        _log("[{0}] ====== 换仓日 ======".format(current_date))
+        _log("[{0}] 打分候选: {1}只通过四因子".format(current_date, len(scored)))
         if len(scored) > 0:
-            print("[{0}] Top{1}排名: {2}".format(
+            _log("[{0}] Top{1}排名: {2}".format(
                 current_date, MAX_POSITIONS,
                 " | ".join(["{0}({1:.4f})".format(c, s) for c, s in top_n])
             ))
             if len(scored) > MAX_POSITIONS:
-                print("[{0}] 候补: {1}".format(
+                _log("[{0}] 候补: {1}".format(
                     current_date,
                     " | ".join(["{0}({1:.4f})".format(c, s) for c, s in scored[MAX_POSITIONS:MAX_POSITIONS+5]])
                 ))
@@ -373,11 +388,11 @@ def handlebar(ContextInfo):
         to_buy = new_holdings - old_holdings
         to_keep = old_holdings & new_holdings
         if to_keep:
-            print("[{0}] 继续持有: {1}".format(current_date, list(to_keep)))
+            _log("[{0}] 继续持有: {1}".format(current_date, list(to_keep)))
         if to_sell:
-            print("[{0}] 换仓卖出: {1}".format(current_date, list(to_sell)))
+            _log("[{0}] 换仓卖出: {1}".format(current_date, list(to_sell)))
         if to_buy:
-            print("[{0}] 换仓买入: {1}".format(current_date, list(to_buy)))
+            _log("[{0}] 换仓买入: {1}".format(current_date, list(to_buy)))
 
         # 卖出不在新Top N中的持仓
         for stockcode in list(ContextInfo.positions.keys()):
@@ -485,11 +500,11 @@ def _execute_buy(ContextInfo, account_id, account_type, stockcode, volume, price
         )
         amount = volume * price
         score_str = " | 评分: {0:.4f}".format(score) if score is not None else ""
-        print("[{0}] >> 买入: {1} | {2}股 x {3:.2f}元 = {4:.0f}元{5}".format(
+        _log("[{0}] >> 买入: {1} | {2}股 x {3:.2f}元 = {4:.0f}元{5}".format(
             trade_date, stockcode, volume, price, amount, score_str))
         return True
     except Exception as e:
-        print("[{0}] !! 买入失败: {1} | {2}".format(trade_date, stockcode, e))
+        _log("[{0}] !! 买入失败: {1} | {2}".format(trade_date, stockcode, e))
         return False
 
 
@@ -546,19 +561,19 @@ def _execute_sell(ContextInfo, account_id, account_type, stockcode, reason, trad
             if stockcode in hist_prices_data and len(hist_prices_data[stockcode]) > 0:
                 current_price = float(hist_prices_data[stockcode][-1])
                 pnl_pct = (current_price - pos.buy_price) / pos.buy_price * 100
-            print("[{0}] << 卖出: {1} | {2}股 | 原因: {3} | 持仓自: {4} | 盈亏: {5:+.2f}%".format(
+            _log("[{0}] << 卖出: {1} | {2}股 | 原因: {3} | 持仓自: {4} | 盈亏: {5:+.2f}%".format(
                 trade_date, stockcode, sell_volume, reason_cn, pos.buy_date, pnl_pct))
         else:
-            print("[{0}] << 卖出: {1} | {2}股 | 原因: {3}".format(
+            _log("[{0}] << 卖出: {1} | {2}股 | 原因: {3}".format(
                 trade_date, stockcode, sell_volume, reason_cn))
     except Exception as e:
-        print("[{0}] !! 卖出失败: {1} | {2}".format(trade_date, stockcode, e))
+        _log("[{0}] !! 卖出失败: {1} | {2}".format(trade_date, stockcode, e))
 
 
 def _log_status(ContextInfo, current_date):
     holdings = list(ContextInfo.positions.keys())
     if len(holdings) == 0:
-        print("[{0}] 当前持仓: 空仓".format(current_date))
+        _log("[{0}] 当前持仓: 空仓".format(current_date))
         return
 
     # 尝试获取最新价格计算浮动盈亏
@@ -580,9 +595,9 @@ def _log_status(ContextInfo, current_date):
             lines.append("  {0}: {1}股 | 成本{2:.2f} | 现价: 无数据".format(
                 code, pos.volume, pos.buy_price))
 
-    print("[{0}] 当前持仓({1}只):".format(current_date, len(holdings)))
+    _log("[{0}] 当前持仓({1}只):".format(current_date, len(holdings)))
     for line in lines:
-        print(line)
+        _log(line)
     if total_value > 0:
-        print("[{0}] 持仓总市值: {1:.0f}元 | 浮动盈亏: {2:+.0f}元".format(
+        _log("[{0}] 持仓总市值: {1:.0f}元 | 浮动盈亏: {2:+.0f}元".format(
             current_date, total_value, total_pnl))
