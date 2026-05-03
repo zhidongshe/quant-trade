@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# -*- coding: gbk -*-
 """
 沪深300多头趋势策略（单文件版）
 
@@ -177,14 +177,14 @@ MAX_POSITIONS = 5
 HARD_STOP_PCT = 0.03
 PROFIT_THRESHOLD = 0.05
 TRAILING_PULLBACK_PCT = 0.05
-REBALANCE_INTERVAL = 10  # 每10个交易日换仓（约两周）
+REBALANCE_INTERVAL = 5  # 每5个交易日换仓（约1周）
 
 
 # ==================== QMT策略主函数 ====================
 
 def init(ContextInfo):
     ContextInfo.set_account('8890358835')
-    ContextInfo.capital = 1000000
+    ContextInfo.capital = 100000
 
     ContextInfo.positions = {}
     ContextInfo.last_trade_date = None
@@ -193,6 +193,7 @@ def init(ContextInfo):
     ContextInfo.rebalance_count = 0
     ContextInfo.last_rebalance_date = None
     ContextInfo.ranked_candidates = []
+    ContextInfo.realized_pnl = 0.0  # 累计已实现盈亏（用于回测时估算总资产）
 
     universe = ContextInfo.get_sector('000300.SH')
     if universe:
@@ -214,6 +215,32 @@ def _normalize_stock_code(code):
     return code
 
 
+def _fetch_market(ContextInfo, stock_codes, fields, count):
+    """统一走 get_market_data_ex；回测/本地读盘用 subscribe=False"""
+    if not stock_codes:
+        return {}
+    try:
+        return ContextInfo.get_market_data_ex(
+            fields, stock_codes, period='1d', start_time='', end_time='', count=count,
+            dividend_type='front', fill_data=True, subscribe=False
+        ) or {}
+    except Exception:
+        return {}
+
+
+def _series_from_market(market, code, field, tail=None):
+    """从 get_market_data_ex 返回的 dict 中取字段序列（最后一行对应当前 bar）。"""
+    if not market or code not in market:
+        return None
+    df = market[code]
+    if df is None or len(df) == 0 or field not in df.columns:
+        return None
+    arr = np.asarray(df[field], dtype=float)
+    if tail is not None and tail > 0 and len(arr) > tail:
+        arr = arr[-tail:]
+    return arr
+
+
 def _sync_positions(ContextInfo, account_id, account_type, current_date):
     """从QMT实际持仓同步到ContextInfo.positions，防止两边脱节"""
     if not account_id:
@@ -227,8 +254,8 @@ def _sync_positions(ContextInfo, account_id, account_type, current_date):
         for p in position_list:
             raw_code = p.m_strInstrumentID
             code = _normalize_stock_code(raw_code)
-            if code != raw_code:
-                _log("[{0}] 代码标准化: {1} → {2}".format(current_date, raw_code, code))
+            #if code != raw_code:
+            #_log("[{0}] 代码标准化: {1} → {2}".format(current_date, raw_code, code))
             vol = int(p.m_nVolume) if hasattr(p, 'm_nVolume') else int(p.m_nCanUseVolume)
             if vol > 0:
                 qmt_holdings[code] = {
@@ -263,6 +290,7 @@ def handlebar(ContextInfo):
     if ContextInfo.last_trade_date == current_date:
         return
     ContextInfo.last_trade_date = current_date
+    ContextInfo.daily_sold_records = []  # 每天清空当日卖出记录
 
     # 从QMT实际持仓同步，防止positions字典和QMT脱节
     account_id = ContextInfo.accountid if hasattr(ContextInfo, 'accountid') else ''
@@ -280,10 +308,14 @@ def handlebar(ContextInfo):
         _log("[{0}] 警告: 无法获取沪深300成分股".format(current_date))
         return
 
-    # 将持仓股票加入universe（提前设置，下一个bar就能获取数据）
+    # 只在持仓股有变化（买入新股或成分股调整导致持仓股不在 universe 中）时才调用 set_universe
+    # 避免每天重复调用导致 get_history_data 隔天为空
     held_stocks = list(ContextInfo.positions.keys())
-    full_universe = list(set(universe + held_stocks))
-    ContextInfo.set_universe(full_universe)
+    missing = [code for code in held_stocks if code not in universe]
+    if missing:
+        full_universe = list(set(universe + held_stocks))
+        ContextInfo.set_universe(full_universe)
+        _log("[{0}] set_universe: 补充{1}只持仓股进 universe".format(current_date, len(missing)))
 
     # 过滤ST股（只过滤买入池，不影响卖出）
     buy_universe = _filter_st_stocks(universe, ContextInfo)
@@ -298,7 +330,6 @@ def handlebar(ContextInfo):
             available_cash = acct_info[0].m_dAvailable
 
     # 3. 遍历现有持仓，检查止损/止盈
-    # 用get_history_data获取所有universe内股票的收盘价（一次调用拿全部）
     positions_to_sell = []
     if len(ContextInfo.positions) > 0:
         hist_prices = ContextInfo.get_history_data(25, '1d', 'close', dividend_type='front', skip_paused=True)
@@ -343,11 +374,29 @@ def handlebar(ContextInfo):
                     current_date, stockcode, sell_reason, pos.buy_price, current_price, pnl_pct))
                 positions_to_sell.append((stockcode, sell_reason))
 
-    # 执行卖出
+    # 执行卖出，并记录当日已卖出股票（当天不再买回）
+    sold_today = set()
     for stockcode, reason in positions_to_sell:
+        if stockcode in ContextInfo.positions:
+            pos = ContextInfo.positions[stockcode]
+            sell_price = pos.buy_price
+            if stockcode in hist_prices and len(hist_prices[stockcode]) > 0:
+                sell_price = float(hist_prices[stockcode][-1])
+                realized = (sell_price - pos.buy_price) * pos.volume
+                ContextInfo.realized_pnl = getattr(ContextInfo, 'realized_pnl', 0.0) + realized
+            # 记录当日卖出
+            ContextInfo.daily_sold_records.append({
+                'stockcode': stockcode,
+                'volume': pos.volume,
+                'buy_price': pos.buy_price,
+                'sell_price': sell_price,
+                'reason': reason,
+                'buy_date': pos.buy_date,
+            })
         _execute_sell(ContextInfo, account_id, account_type, stockcode, reason, current_date)
         if stockcode in ContextInfo.positions:
             del ContextInfo.positions[stockcode]
+        sold_today.add(stockcode)
 
     # 4. 换仓/补仓逻辑
     ContextInfo.rebalance_count = getattr(ContextInfo, 'rebalance_count', 0) + 1
@@ -358,31 +407,36 @@ def handlebar(ContextInfo):
         if acct_info:
             available_cash = acct_info[0].m_dAvailable
 
-    # 一次性获取所有universe的历史数据
+    # 一次性获取所有需要的历史数据
     hist_prices = ContextInfo.get_history_data(70, '1d', 'close', dividend_type='front', skip_paused=True)
     hist_volumes = ContextInfo.get_history_data(25, '1d', 'volume', dividend_type='front', skip_paused=True)
+
+    got_prices = len(hist_prices) if hist_prices else 0
+    got_volumes = len(hist_volumes) if hist_volumes else 0
+    _log("[{0}] 数据获取: close={1}只, volume={2}只".format(current_date, got_prices, got_volumes))
+
+    # 每天对所有候选股打分（不管是不是换仓日）
+    scored = []
+    for stockcode in buy_universe:
+        if stockcode not in hist_prices or len(hist_prices[stockcode]) < 70:
+            continue
+        if stockcode not in hist_volumes or len(hist_volumes[stockcode]) < 20:
+            continue
+        prices_arr = np.array(hist_prices[stockcode])
+        volumes_arr = np.array(hist_volumes[stockcode])
+        s = score_stock(prices_arr, volumes_arr)
+        if s is not None:
+            scored.append((stockcode, s))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    ContextInfo.ranked_candidates = scored
 
     if is_rebalance_day:
         ContextInfo.rebalance_count = 0
         ContextInfo.last_rebalance_date = current_date
 
-        # 对所有候选股打分
-        scored = []
-        for stockcode in buy_universe:
-            if stockcode not in hist_prices or len(hist_prices[stockcode]) < 70:
-                continue
-            if stockcode not in hist_volumes or len(hist_volumes[stockcode]) < 20:
-                continue
-            prices_arr = np.array(hist_prices[stockcode])
-            volumes_arr = np.array(hist_volumes[stockcode])
-            s = score_stock(prices_arr, volumes_arr)
-            if s is not None:
-                scored.append((stockcode, s))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
         top_n = scored[:MAX_POSITIONS]
         top_codes = [x[0] for x in top_n]
-        ContextInfo.ranked_candidates = scored
 
         _log("[{0}] ====== 换仓日 ======".format(current_date))
         _log("[{0}] 打分候选: {1}只通过四因子".format(current_date, len(scored)))
@@ -399,7 +453,18 @@ def handlebar(ContextInfo):
 
         old_holdings = set(ContextInfo.positions.keys())
         new_holdings = set(top_codes)
-        to_sell = old_holdings - new_holdings
+
+        # 盈利保护：盈利>10%的持仓不因换仓而强制卖出
+        to_sell = set()
+        for stockcode in old_holdings - new_holdings:
+            pos = ContextInfo.positions[stockcode]
+            if stockcode in hist_prices and len(hist_prices[stockcode]) > 0:
+                cur_price = float(hist_prices[stockcode][-1])
+                profit_pct = (cur_price - pos.buy_price) / pos.buy_price
+                if profit_pct > 0.10:
+                    continue
+            to_sell.add(stockcode)
+
         to_buy = new_holdings - old_holdings
         to_keep = old_holdings & new_holdings
         if to_keep:
@@ -409,12 +474,33 @@ def handlebar(ContextInfo):
         if to_buy:
             _log("[{0}] 换仓买入: {1}".format(current_date, list(to_buy)))
 
-        # 卖出不在新Top N中的持仓
+        # 卖出不在新Top N中的持仓（盈利>10%的保留）
         for stockcode in list(ContextInfo.positions.keys()):
             if stockcode not in top_codes:
+                pos = ContextInfo.positions[stockcode]
+                sell_price = pos.buy_price
+                if stockcode in hist_prices and len(hist_prices[stockcode]) > 0:
+                    sell_price = float(hist_prices[stockcode][-1])
+                    profit_pct = (sell_price - pos.buy_price) / pos.buy_price
+                    if profit_pct > 0.10:
+                        _log("[{0}] 换仓保留: {1} | 盈利{2:+.2f}%，不强制卖出".format(
+                            current_date, stockcode, profit_pct * 100))
+                        continue
+                    realized = (sell_price - pos.buy_price) * pos.volume
+                    ContextInfo.realized_pnl = getattr(ContextInfo, 'realized_pnl', 0.0) + realized
+                # 记录当日卖出
+                ContextInfo.daily_sold_records.append({
+                    'stockcode': stockcode,
+                    'volume': pos.volume,
+                    'buy_price': pos.buy_price,
+                    'sell_price': sell_price,
+                    'reason': 'rebalance',
+                    'buy_date': pos.buy_date,
+                })
                 _execute_sell(ContextInfo, account_id, account_type, stockcode, 'rebalance', current_date)
                 if stockcode in ContextInfo.positions:
                     del ContextInfo.positions[stockcode]
+                sold_today.add(stockcode)
 
         # 买入新Top N中未持仓的
         current_holdings = len(ContextInfo.positions)
@@ -422,6 +508,8 @@ def handlebar(ContextInfo):
             if current_holdings >= MAX_POSITIONS:
                 break
             if stockcode in ContextInfo.positions:
+                continue
+            if stockcode in sold_today:
                 continue
             if stockcode not in hist_prices:
                 continue
@@ -447,7 +535,7 @@ def handlebar(ContextInfo):
                 current_holdings += 1
 
     else:
-        # 非换仓日：如果止损导致有空仓位，从缓存排名中补仓
+        # 非换仓日：如果止损导致有空仓位，从当天排名中补仓
         current_holdings = len(ContextInfo.positions)
         candidates = getattr(ContextInfo, 'ranked_candidates', [])
         if current_holdings < MAX_POSITIONS and len(candidates) > 0:
@@ -455,6 +543,8 @@ def handlebar(ContextInfo):
                 if current_holdings >= MAX_POSITIONS:
                     break
                 if stockcode in ContextInfo.positions:
+                    continue
+                if stockcode in sold_today:
                     continue
                 if stockcode not in hist_prices or len(hist_prices[stockcode]) < 70:
                     continue
@@ -587,32 +677,130 @@ def _execute_sell(ContextInfo, account_id, account_type, stockcode, reason, trad
 
 def _log_status(ContextInfo, current_date):
     holdings = list(ContextInfo.positions.keys())
-    if len(holdings) == 0:
-        _log("[{0}] 当前持仓: 空仓".format(current_date))
+    sold_records = getattr(ContextInfo, 'daily_sold_records', [])
+
+    # 既无持仓也无卖出 → 空仓
+    if len(holdings) == 0 and len(sold_records) == 0:
+        total_assets = None
+        account_id = getattr(ContextInfo, 'accountid', '')
+        if account_id:
+            try:
+                acct_info = get_trade_detail_data(account_id, 'STOCK', 'ACCOUNT')
+                if acct_info:
+                    total_assets = acct_info[0].m_dBalance
+            except Exception:
+                pass
+        if total_assets is None:
+            realized_pnl = getattr(ContextInfo, 'realized_pnl', 0)
+            total_assets = ContextInfo.capital + realized_pnl
+        total_profit = total_assets - ContextInfo.capital
+        _log("[{0}] 当前持仓: 空仓 | 总资产: {1:.0f}元 | 总盈亏: {2:+.0f}元".format(
+            current_date, total_assets, total_profit))
         return
 
-    # 尝试获取最新价格计算浮动盈亏
-    lines = []
-    total_pnl = 0
-    total_value = 0
-    hist = ContextInfo.get_history_data(1, '1d', 'close', dividend_type='front', skip_paused=True)
-    for code in holdings:
-        pos = ContextInfo.positions[code]
-        if code in hist and len(hist[code]) > 0:
-            cur = float(hist[code][-1])
-            pnl = (cur - pos.buy_price) / pos.buy_price * 100
-            value = cur * pos.volume
-            total_pnl += (cur - pos.buy_price) * pos.volume
-            total_value += value
-            lines.append("  {0}: {1}股 | 成本{2:.2f} | 现价{3:.2f} | {4:+.2f}%".format(
-                code, pos.volume, pos.buy_price, cur, pnl))
-        else:
-            lines.append("  {0}: {1}股 | 成本{2:.2f} | 现价: 无数据".format(
-                code, pos.volume, pos.buy_price))
+    # 获取最近2天收盘价，用于计算今日盈亏
+    hist = ContextInfo.get_history_data(2, '1d', 'close', dividend_type='front', skip_paused=True)
 
-    _log("[{0}] 当前持仓({1}只):".format(current_date, len(holdings)))
-    for line in lines:
-        _log(line)
-    if total_value > 0:
-        _log("[{0}] 持仓总市值: {1:.0f}元 | 浮动盈亏: {2:+.0f}元".format(
-            current_date, total_value, total_pnl))
+    total_value = 0       # 持仓总市值
+    total_pnl = 0         # 持仓总盈亏（含已卖出）
+    total_today_pnl = 0   # 今日持仓盈亏（含已卖出）
+    total_cost = 0        # 持仓总成本（含已卖出）
+
+    # 1. 打印当前持仓
+    if len(holdings) > 0:
+        _log("[{0}] 当前持仓({1}只):".format(current_date, len(holdings)))
+        for code in holdings:
+            pos = ContextInfo.positions[code]
+            if code in hist and len(hist[code]) >= 1:
+                cur = float(hist[code][-1])
+                value = cur * pos.volume                 # 持仓市值
+                pnl = (cur - pos.buy_price) * pos.volume  # 持仓盈亏
+                cost = pos.buy_price * pos.volume         # 持仓成本
+
+                # 今日盈亏：今天买入的用买入价算；之前买入的用昨日收盘价算
+                if len(hist[code]) >= 2 and pos.buy_date != current_date:
+                    prev = float(hist[code][-2])
+                    today_pnl = (cur - prev) * pos.volume
+                    today_pnl_pct = ((cur - prev) / prev * 100) if prev > 0 else 0
+                elif pos.buy_date == current_date:
+                    today_pnl = (cur - pos.buy_price) * pos.volume
+                    today_pnl_pct = ((cur - pos.buy_price) / pos.buy_price * 100) if pos.buy_price > 0 else 0
+                else:
+                    today_pnl = None
+                    today_pnl_pct = None
+
+                pnl_pct = ((cur - pos.buy_price) / pos.buy_price * 100) if pos.buy_price > 0 else 0
+
+                if today_pnl is not None:
+                    total_today_pnl += today_pnl
+                    _log("  {0}: {1}股 | 成本{2:.2f} | 现价{3:.2f} | 市值{4:.0f}元 | 持仓盈亏{5:+.0f}元({6:+.2f}%) | 今日盈亏{7:+.0f}元({8:+.2f}%)".format(
+                        code, pos.volume, pos.buy_price, cur, value, pnl, pnl_pct, today_pnl, today_pnl_pct))
+                else:
+                    _log("  {0}: {1}股 | 成本{2:.2f} | 现价{3:.2f} | 市值{4:.0f}元 | 持仓盈亏{5:+.0f}元({6:+.2f}%) | 今日盈亏: 无数据".format(
+                        code, pos.volume, pos.buy_price, cur, value, pnl, pnl_pct))
+
+                total_value += value
+                total_pnl += pnl
+                total_cost += cost
+            else:
+                _log("  {0}: 无行情数据".format(code))
+
+    # 2. 打印今日卖出，并汇总盈亏
+    if len(sold_records) > 0:
+        _log("[{0}] 今日卖出({1}只):".format(current_date, len(sold_records)))
+        for rec in sold_records:
+            code = rec['stockcode']
+            volume = rec['volume']
+            buy_price = rec['buy_price']
+            sell_price = rec['sell_price']
+            reason = rec['reason']
+            buy_date = rec['buy_date']
+
+            pnl = (sell_price - buy_price) * volume
+            pnl_pct = ((sell_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
+
+            # 今日盈亏
+            if buy_date == current_date:
+                today_pnl = pnl
+                today_pnl_pct = pnl_pct
+            elif code in hist and len(hist[code]) >= 2:
+                prev = float(hist[code][-2])
+                today_pnl = (sell_price - prev) * volume
+                today_pnl_pct = ((sell_price - prev) / prev * 100) if prev > 0 else 0
+            else:
+                today_pnl = None
+                today_pnl_pct = None
+
+            if today_pnl is not None:
+                total_today_pnl += today_pnl
+                _log("  {0}: {1}股 | 成本{2:.2f} | 卖出价{3:.2f} | 持仓盈亏{4:+.0f}元({5:+.2f}%) | 今日盈亏{6:+.0f}元({7:+.2f}%) | 原因: {8}".format(
+                    code, volume, buy_price, sell_price, pnl, pnl_pct, today_pnl, today_pnl_pct, reason))
+            else:
+                _log("  {0}: {1}股 | 成本{2:.2f} | 卖出价{3:.2f} | 持仓盈亏{4:+.0f}元({5:+.2f}%) | 今日盈亏: 无数据 | 原因: {6}".format(
+                    code, volume, buy_price, sell_price, pnl, pnl_pct, reason))
+
+            total_pnl += pnl
+            total_cost += buy_price * volume
+
+    # 3. 汇总
+    total_assets = None
+    account_id = getattr(ContextInfo, 'accountid', '')
+    if account_id:
+        try:
+            acct_info = get_trade_detail_data(account_id, 'STOCK', 'ACCOUNT')
+            if acct_info:
+                total_assets = acct_info[0].m_dBalance
+        except Exception:
+            pass
+    if total_assets is None:
+        realized_pnl = getattr(ContextInfo, 'realized_pnl', 0)
+        total_assets = ContextInfo.capital + realized_pnl + total_pnl
+
+    total_profit = total_assets - ContextInfo.capital
+    total_profit_pct = (total_profit / ContextInfo.capital * 100) if ContextInfo.capital > 0 else 0
+    total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+    yesterday_value = total_value - total_today_pnl
+    total_today_pnl_pct = (total_today_pnl / yesterday_value * 100) if yesterday_value > 0 else 0
+
+    _log("[{0}] 总资产: {1:.0f}元 | 总盈亏: {2:+.0f}元({3:+.2f}%) | 持仓总市值: {4:.0f}元 | 持仓总盈亏: {5:+.0f}元({6:+.2f}%) | 今日持仓盈亏: {7:+.0f}元({8:+.2f}%)".format(
+        current_date, total_assets, total_profit, total_profit_pct, total_value, total_pnl, total_pnl_pct, total_today_pnl, total_today_pnl_pct))
