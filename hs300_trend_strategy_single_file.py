@@ -194,6 +194,7 @@ def init(ContextInfo):
     ContextInfo.last_rebalance_date = None
     ContextInfo.ranked_candidates = []
     ContextInfo.realized_pnl = 0.0  # 累计已实现盈亏（用于回测时估算总资产）
+    ContextInfo.total_cost = 0.0    # 累计交易成本
 
     universe = ContextInfo.get_sector('000300.SH')
     if universe:
@@ -290,7 +291,10 @@ def handlebar(ContextInfo):
     if ContextInfo.last_trade_date == current_date:
         return
     ContextInfo.last_trade_date = current_date
-    ContextInfo.daily_sold_records = []  # 每天清空当日卖出记录
+    # 把前一天交易成本累加到累计值，再清空当日记录
+    ContextInfo.total_cost = getattr(ContextInfo, 'total_cost', 0.0) + getattr(ContextInfo, 'daily_cost', 0.0)
+    ContextInfo.daily_sold_records = []
+    ContextInfo.daily_cost = 0.0
 
     # 从QMT实际持仓同步，防止positions字典和QMT脱节
     account_id = ContextInfo.accountid if hasattr(ContextInfo, 'accountid') else ''
@@ -393,6 +397,11 @@ def handlebar(ContextInfo):
                 'reason': reason,
                 'buy_date': pos.buy_date,
             })
+            # 计算卖出交易成本
+            amount = pos.volume * sell_price
+            commission = max(amount * 0.0001, 5.0)
+            stamp_tax = amount * 0.001
+            ContextInfo.daily_cost = getattr(ContextInfo, 'daily_cost', 0.0) + commission + stamp_tax
         _execute_sell(ContextInfo, account_id, account_type, stockcode, reason, current_date)
         if stockcode in ContextInfo.positions:
             del ContextInfo.positions[stockcode]
@@ -497,6 +506,11 @@ def handlebar(ContextInfo):
                     'reason': 'rebalance',
                     'buy_date': pos.buy_date,
                 })
+                # 计算卖出交易成本
+                amount = pos.volume * sell_price
+                commission = max(amount * 0.0001, 5.0)
+                stamp_tax = amount * 0.001
+                ContextInfo.daily_cost = getattr(ContextInfo, 'daily_cost', 0.0) + commission + stamp_tax
                 _execute_sell(ContextInfo, account_id, account_type, stockcode, 'rebalance', current_date)
                 if stockcode in ContextInfo.positions:
                     del ContextInfo.positions[stockcode]
@@ -604,9 +618,11 @@ def _execute_buy(ContextInfo, account_id, account_type, stockcode, volume, price
             ContextInfo
         )
         amount = volume * price
+        commission = max(amount * 0.0001, 5.0)
+        ContextInfo.daily_cost = getattr(ContextInfo, 'daily_cost', 0.0) + commission
         score_str = " | 评分: {0:.4f}".format(score) if score is not None else ""
-        _log("[{0}] >> 买入: {1} | {2}股 x {3:.2f}元 = {4:.0f}元{5}".format(
-            trade_date, stockcode, volume, price, amount, score_str))
+        _log("[{0}] >> 买入: {1} | {2}股 x {3:.2f}元 = {4:.0f}元 | 佣金: {5:.2f}元{6}".format(
+            trade_date, stockcode, volume, price, amount, commission, score_str))
         return True
     except Exception as e:
         _log("[{0}] !! 买入失败: {1} | {2}".format(trade_date, stockcode, e))
@@ -802,5 +818,20 @@ def _log_status(ContextInfo, current_date):
     yesterday_value = total_value - total_today_pnl
     total_today_pnl_pct = (total_today_pnl / yesterday_value * 100) if yesterday_value > 0 else 0
 
-    _log("[{0}] 总资产: {1:.0f}元 | 总盈亏: {2:+.0f}元({3:+.2f}%) | 持仓总市值: {4:.0f}元 | 持仓总盈亏: {5:+.0f}元({6:+.2f}%) | 今日持仓盈亏: {7:+.0f}元({8:+.2f}%)".format(
-        current_date, total_assets, total_profit, total_profit_pct, total_value, total_pnl, total_pnl_pct, total_today_pnl, total_today_pnl_pct))
+    # 资金余额
+    cash_balance = None
+    if account_id:
+        try:
+            acct_info = get_trade_detail_data(account_id, 'STOCK', 'ACCOUNT')
+            if acct_info:
+                cash_balance = acct_info[0].m_dAvailable
+        except Exception:
+            pass
+    if cash_balance is None:
+        cash_balance = total_assets - total_value
+
+    daily_cost = getattr(ContextInfo, 'daily_cost', 0.0)
+    total_cost_acc = getattr(ContextInfo, 'total_cost', 0.0) + daily_cost
+
+    _log("[{0}] 总资产: {1:.0f}元 | 总盈亏: {2:+.0f}元({3:+.2f}%) | 持仓总市值: {4:.0f}元 | 持仓总盈亏: {5:+.0f}元({6:+.2f}%) | 今日持仓盈亏: {7:+.0f}元({8:+.2f}%) | 资金余额: {9:.0f}元 | 当日交易成本: {10:.2f}元 | 累计交易成本: {11:.2f}元".format(
+        current_date, total_assets, total_profit, total_profit_pct, total_value, total_pnl, total_pnl_pct, total_today_pnl, total_today_pnl_pct, cash_balance, daily_cost, total_cost_acc))
