@@ -17,20 +17,35 @@
 
 import numpy as np
 import os
+from datetime import datetime
 
 # ==================== 日志模块 ====================
 
-_LOG_FILE_PATH = r'c:\量化日志.log'
+_LOG_FILE_PATH = None
+
+
+def _init_log():
+    """初始化日志文件路径，文件名带时间戳"""
+    global _LOG_FILE_PATH
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    _LOG_FILE_PATH = r'c:\量化日志_{0}.log'.format(ts)
 
 
 def _log(msg):
-    """同时输出到终端和日志文件"""
-    print(msg)
+    """同时输出到终端和日志文件，带时间戳"""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    line = '{0} {1}'.format(timestamp, msg)
+    print(line)
+    if _LOG_FILE_PATH is None:
+        _init_log()
     try:
         with open(_LOG_FILE_PATH, 'a', encoding='gbk') as f:
-            f.write(msg + '\n')
+            f.write(line + '\n')
     except Exception:
         pass
+
+
+_init_log()
 
 
 # ==================== 指标计算模块 ====================
