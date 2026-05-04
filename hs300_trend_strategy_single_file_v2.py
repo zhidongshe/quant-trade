@@ -800,8 +800,9 @@ def _log_status(ContextInfo, current_date):
             ContextInfo.max_drawdown = drawdown
 
         total_profit = total_assets - ContextInfo.capital
-        _log("[{0}] 当前持仓: 空仓 | 总资产: {1:.0f}元 | 总盈亏: {2:+.0f}元 | 最大回撤: {3:.0f}元 | 交易{4}笔 | 胜率{5:.1f}% | 盈亏比{6:.2f}".format(
-            current_date, total_assets, total_profit, ContextInfo.max_drawdown,
+        dd_pct = (ContextInfo.max_drawdown / ContextInfo.peak_assets * 100) if ContextInfo.peak_assets > 0 else 0
+        _log("[{0}] 当前持仓: 空仓 | 总资产: {1:.0f}元 | 总盈亏: {2:+.0f}元 | 最大回撤: {3:.2f}% | 交易{4}笔 | 胜率{5:.1f}% | 盈亏比{6:.2f}".format(
+            current_date, total_assets, total_profit, dd_pct,
             trade_count, win_rate, profit_factor))
         return
 
@@ -934,6 +935,9 @@ def _log_status(ContextInfo, current_date):
     if cash_balance is None:
         cash_balance = total_assets - total_value
 
-    _log("[{0}] ====== 总资产: {1:.0f}元 | 总盈亏: {2:+.0f}元({3:+.2f}%) | 持仓总市值: {4:.0f}元 | 持仓总盈亏: {5:+.0f}元({6:+.2f}%) | 今日持仓盈亏: {7:+.0f}元({8:+.2f}%) | 资金余额: {9:.0f}元 | 当日交易成本: {10:.2f}元 | 累计交易成本: {11:.2f}元 | 最大回撤: {12:.0f}元 | 交易{13}笔 | 胜率{14:.1f}% | 盈亏比{15:.2f}".format(
-        current_date, total_assets, total_profit, total_profit_pct, total_value, total_pnl, total_pnl_pct, total_today_pnl, total_today_pnl_pct, cash_balance, daily_cost, total_cost_acc, ContextInfo.max_drawdown, trade_count, win_rate, profit_factor))
+    dd_pct = (ContextInfo.max_drawdown / ContextInfo.peak_assets * 100) if ContextInfo.peak_assets > 0 else 0
+    _log("[{0}] ====== 总资产: {1:.0f}元 | 总盈亏: {2:+.0f}元({3:+.2f}%) | 持仓总市值: {4:.0f}元 | 持仓总盈亏: {5:+.0f}元({6:+.2f}%) | 今日持仓盈亏: {7:+.0f}元({8:+.2f}%) | 资金余额: {9:.0f}元".format(
+        current_date, total_assets, total_profit, total_profit_pct, total_value, total_pnl, total_pnl_pct, total_today_pnl, total_today_pnl_pct, cash_balance))
+    _log("[{0}] ====== 当日交易成本: {1:.2f}元 | 累计交易成本: {2:.2f}元 | 最大回撤: {3:.2f}% | 交易{4}笔 | 胜率{5:.1f}% | 盈亏比{6:.2f}".format(
+        current_date, daily_cost, total_cost_acc, dd_pct, trade_count, win_rate, profit_factor))
     _log("================================================")
