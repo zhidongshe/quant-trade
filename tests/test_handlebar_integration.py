@@ -69,14 +69,14 @@ def passorder(*args):
 # ========== 测试用例 ==========
 
 def test_sell_hard_stop():
-    """测试硬止损：价格跌超3%应触发卖出"""
+    """测试硬止损：价格跌超5%应触发卖出"""
     pos = Position('000001.SZ', buy_price=100.0, buy_date='20260101', volume=1000)
-    # 跌了3.1%
-    assert check_stop_loss(pos, 96.9, HARD_STOP_PCT) == True
-    # 只跌了2%
-    assert check_stop_loss(pos, 98.0, HARD_STOP_PCT) == False
-    # 正好3%边界
-    assert check_stop_loss(pos, 97.0, HARD_STOP_PCT) == True
+    # 跌了5.1%
+    assert check_stop_loss(pos, 94.9, HARD_STOP_PCT) == True
+    # 只跌了4%
+    assert check_stop_loss(pos, 96.0, HARD_STOP_PCT) == False
+    # 正好5%边界
+    assert check_stop_loss(pos, 95.0, HARD_STOP_PCT) == True
 
 
 def test_sell_trend_break():
@@ -87,16 +87,16 @@ def test_sell_trend_break():
 
 
 def test_sell_trailing_stop():
-    """测试跟踪止盈：盈利5%后从高点回落5%应触发"""
+    """测试跟踪止盈：盈利10%后从高点回落8%应触发"""
     pos = Position('000001.SZ', buy_price=100.0, buy_date='20260101', volume=1000)
 
-    # 价格涨到106（盈利6%，超过5%阈值），更新最高价
-    result = check_trailing_stop(pos, 106.0, PROFIT_THRESHOLD, TRAILING_PULLBACK_PCT)
+    # 价格涨到115（盈利15%，超过10%阈值），更新最高价
+    result = check_trailing_stop(pos, 115.0, PROFIT_THRESHOLD, TRAILING_PULLBACK_PCT)
     assert result == False
-    assert pos.highest_price == 106.0
+    assert pos.highest_price == 115.0
 
-    # 从最高106回落到100.7（回落5%=106*0.95=100.7）
-    result = check_trailing_stop(pos, 100.6, PROFIT_THRESHOLD, TRAILING_PULLBACK_PCT)
+    # 从最高115回落到105.8（回落8%=115*0.92=105.8）
+    result = check_trailing_stop(pos, 105.7, PROFIT_THRESHOLD, TRAILING_PULLBACK_PCT)
     assert result == True
 
 
@@ -124,8 +124,8 @@ def test_sell_logic_with_mock_context():
     full_universe = list(set(ctx._sector_stocks + held_stocks))
     ctx.set_universe(full_universe)
 
-    # 模拟历史数据：000001跌到96（触发硬止损），000002正常
-    ctx._history_data[('000001.SZ', 'close')] = list(np.linspace(100, 96, 25))
+    # 模拟历史数据：000001跌到94（跌6%，触发5%硬止损），000002正常
+    ctx._history_data[('000001.SZ', 'close')] = list(np.linspace(100, 94, 25))
     ctx._history_data[('000002.SZ', 'close')] = list(np.linspace(100, 102, 25))
 
     # 执行卖出检查逻辑
@@ -322,8 +322,8 @@ def test_score_stock_returns_none_when_signal_fails():
     assert score_stock(prices, volumes.astype(float)) is None
 
 
-def test_score_stock_returns_float_when_signal_passes():
-    """满足四因子时score_stock应返回浮点分数"""
+def test_score_stock_returns_dict_when_signal_passes():
+    """满足四因子时score_stock应返回因子字典"""
     np.random.seed(100)
     base = np.linspace(80, 130, 70)
     prices = base + np.random.normal(0, 0.3, 70)
@@ -333,12 +333,15 @@ def test_score_stock_returns_float_when_signal_passes():
 
     result = score_stock(prices, volumes)
     if result is not None:
-        assert isinstance(result, float)
-        assert result > 0
+        assert isinstance(result, dict)
+        assert 'trend_score' in result
+        assert 'ma_spread_score' in result
+        assert 'macd_score' in result
+        assert 'volume_score' in result
 
 
-def test_score_stock_ranking_order():
-    """趋势更强的股票应获得更高分数"""
+def test_score_stock_trend_factor_ranking():
+    """趋势更强的股票应有更高的原始趋势得分"""
     np.random.seed(42)
     # 强趋势股: 从80涨到150
     strong_prices = np.linspace(80, 150, 70).astype(float)
@@ -348,15 +351,15 @@ def test_score_stock_ranking_order():
     volumes = np.ones(25, dtype=float) * 1000000
     volumes[-1] = 2000000
 
-    strong_score = score_stock(strong_prices, volumes)
-    weak_score = score_stock(weak_prices, volumes)
+    strong = score_stock(strong_prices, volumes)
+    weak = score_stock(weak_prices, volumes)
 
-    if strong_score is not None and weak_score is not None:
-        assert strong_score > weak_score
+    if strong is not None and weak is not None:
+        assert strong['trend_score'] > weak['trend_score']
 
 
-def test_score_stock_volume_impact():
-    """放量更大的股票应获得更高分数"""
+def test_score_stock_volume_factor_impact():
+    """放量更大的股票应有更高的原始成交量得分"""
     np.random.seed(42)
     base_prices = np.linspace(80, 130, 70).astype(float)
 
@@ -370,7 +373,7 @@ def test_score_stock_volume_impact():
     score_high = score_stock(base_prices, vol_high)
 
     if score_low is not None and score_high is not None:
-        assert score_high > score_low
+        assert score_high['volume_score'] > score_low['volume_score']
 
 
 if __name__ == '__main__':

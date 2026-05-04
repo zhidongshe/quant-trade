@@ -1,4 +1,4 @@
-# -*- coding: gbk -*-
+# -*- coding: utf-8 -*-
 """
 沪深300多头趋势策略（单文件版）
 
@@ -215,6 +215,8 @@ def init(ContextInfo):
     ContextInfo.realized_pnl = 0.0  # 累计已实现盈亏（用于回测时估算总资产）
     ContextInfo.total_cost = 0.0    # 累计交易成本
     ContextInfo.trading_day_index = 0  # 交易日计数器（用于最低持有期）
+    ContextInfo.market_ok_streak = 0   # 大盘连续OK天数，≥2才允许买入
+    ContextInfo.market_weak_streak = 0 # 大盘连续弱天数，≥2则清仓非强势股
 
     universe = ContextInfo.get_sector('000300.SH')
     if universe:
@@ -352,7 +354,13 @@ def handlebar(ContextInfo):
     if '000300.SH' in hist_prices and len(hist_prices['000300.SH']) >= 70:
         idx_prices = np.array(hist_prices['000300.SH'], dtype=float)
     market_ok = _check_market_trend(idx_prices)
-    market_str = "大盘OK" if market_ok else "大盘弱"
+    if market_ok:
+        ContextInfo.market_ok_streak = getattr(ContextInfo, 'market_ok_streak', 0) + 1
+        ContextInfo.market_weak_streak = 0
+    else:
+        ContextInfo.market_ok_streak = 0
+        ContextInfo.market_weak_streak = getattr(ContextInfo, 'market_weak_streak', 0) + 1
+    market_str = "大盘OK({0}天)".format(ContextInfo.market_ok_streak) if market_ok else "大盘弱({0}天)".format(ContextInfo.market_weak_streak)
     _log("[{0}] ===== 日期: {0} | 持仓: {1}只 | {2} | 距下次换仓: {3}个交易日 =====".format(
         current_date, len(holdings), market_str,
         REBALANCE_INTERVAL - ContextInfo.rebalance_count
@@ -380,6 +388,9 @@ def handlebar(ContextInfo):
             prices_arr = np.array(prices_list)
             ma20 = np.mean(prices_arr[-20:])
 
+            # 计算MACD用于动能衰竭判断
+            dif, dea, hist = macd(prices_arr)
+
             # 计算持有交易日数
             hold_days = ContextInfo.trading_day_index - getattr(pos, 'buy_trading_day_idx', 0)
 
@@ -390,17 +401,19 @@ def handlebar(ContextInfo):
             if check_stop_loss(pos, current_price, HARD_STOP_PCT):
                 should_sell = True
                 sell_reason = 'hard_stop'
-            # 单日暴跌保护：绕过最低持有期，防止次日暴跌无法出逃
+            # 单日暴跌保护：防止次日暴跌无法出逃
             elif len(prices_list) >= 2:
                 prev_price = float(prices_list[-2])
                 daily_change = (current_price - prev_price) / prev_price if prev_price > 0 else 0
-                if daily_change <= -0.07 or current_price <= pos.buy_price * 0.93:
+                if daily_change <= -0.07:
                     should_sell = True
                     sell_reason = 'crash_protection'
-            # 最低持有期内不检查趋势破坏和跟踪止盈
-            elif hold_days >= MIN_HOLD_DAYS:
-                # 换仓日才检查趋势破坏；非换仓日只检查跟踪止盈
-                if is_rebalance_day and check_trend_break(current_price, ma20):
+
+            # 取消最低持有期限制，买入次日即可检查全部卖出条件（趋势/MACD/止盈）
+            macd_weakening = (hist[-1] <= 0) and (len(hist) >= 2) and (hist[-1] <= hist[-2])
+            if not should_sell:
+                # 趋势破坏：跌破MA20 且 MACD动能衰竭（双确认）
+                if check_trend_break(current_price, ma20) and macd_weakening:
                     should_sell = True
                     sell_reason = 'trend_break'
                 elif check_trailing_stop(pos, current_price, PROFIT_THRESHOLD, TRAILING_PULLBACK_PCT):
@@ -412,6 +425,18 @@ def handlebar(ContextInfo):
                 _log("[{0}] 触发卖出: {1} | 原因: {2} | 持有{3}天 | 买入价: {4:.2f} | 现价: {5:.2f} | 盈亏: {6:+.2f}%".format(
                     current_date, stockcode, sell_reason, hold_days, pos.buy_price, current_price, pnl_pct))
                 positions_to_sell.append((stockcode, sell_reason))
+
+    # 大盘连续2天弱，清仓非强势股（保留已进入跟踪止盈区间的股票）
+    if ContextInfo.market_weak_streak >= 2:
+        already_marked = {s for s, _ in positions_to_sell}
+        for stockcode, pos in list(ContextInfo.positions.items()):
+            if stockcode in already_marked:
+                continue
+            max_profit_pct = (pos.highest_price - pos.buy_price) / pos.buy_price
+            if max_profit_pct <= PROFIT_THRESHOLD:
+                positions_to_sell.append((stockcode, 'market_weak'))
+                _log("[{0}] 大盘连续弱{1}天，清仓: {2} | 最高盈利{3:+.2f}%，未达强势股标准".format(
+                    current_date, ContextInfo.market_weak_streak, stockcode, max_profit_pct * 100))
 
     # 执行卖出，并记录当日已卖出股票（当天不再买回）
     sold_today = set()
@@ -581,8 +606,8 @@ def handlebar(ContextInfo):
                     del ContextInfo.positions[stockcode]
                 sold_today.add(stockcode)
 
-        # 买入新Top N中未持仓的（大盘OK时才买）
-        if market_ok:
+        # 买入新Top N中未持仓的（大盘连续2天OK才买）
+        if ContextInfo.market_ok_streak >= 2:
             current_holdings = len(ContextInfo.positions)
             for stockcode, s in top_n:
                 if current_holdings >= MAX_POSITIONS:
@@ -620,8 +645,8 @@ def handlebar(ContextInfo):
             _log("[{0}] 大盘弱势，换仓日跳过买入".format(current_date))
 
     else:
-        # 非换仓日：大盘OK时才补仓
-        if market_ok:
+        # 非换仓日：大盘连续2天OK才补仓
+        if ContextInfo.market_ok_streak >= 2:
             current_holdings = len(ContextInfo.positions)
             cached = getattr(ContextInfo, 'ranked_candidates', (None, []))
             cand_date, candidates = cached
@@ -758,6 +783,8 @@ def _execute_sell(ContextInfo, account_id, account_type, stockcode, reason, trad
             'trailing_stop': '跟踪止盈',
             'rebalance': '换仓调出',
             'crash_protection': '暴跌保护',
+            'macd_weak': 'MACD衰竭',
+            'market_weak': '大盘弱势清仓',
         }
         reason_cn = reason_map.get(reason, reason)
         pos = ContextInfo.positions.get(stockcode)
