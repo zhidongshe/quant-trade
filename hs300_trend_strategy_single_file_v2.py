@@ -201,6 +201,7 @@ def init(ContextInfo):
     ContextInfo.realized_pnl = 0.0  # 累计已实现盈亏（用于回测时估算总资产）
     ContextInfo.total_cost = 0.0    # 累计交易成本
     ContextInfo.trading_day_index = 0  # 交易日计数器（用于最低持有期）
+    ContextInfo.daily_realized_pnl = 0.0  # 当日已实现盈亏（QMT持久化延迟，用于缓冲）
 
     # v2新增统计字段
     ContextInfo.trade_count = 0       # 总交易笔数（按卖出统计）
@@ -295,6 +296,9 @@ def handlebar(ContextInfo):
     ContextInfo.last_trade_date = current_date
     # 把前一天交易成本累加到累计值，再清空当日记录
     ContextInfo.total_cost = getattr(ContextInfo, 'total_cost', 0.0) + getattr(ContextInfo, 'daily_cost', 0.0)
+    # v2 fix: QMT中ContextInfo属性赋值当天不生效，daily_realized_pnl次日合并
+    ContextInfo.realized_pnl = getattr(ContextInfo, 'realized_pnl', 0.0) + getattr(ContextInfo, 'daily_realized_pnl', 0.0)
+    ContextInfo.daily_realized_pnl = 0.0
     ContextInfo.daily_sold_records = []
     ContextInfo.daily_cost = 0.0
 
@@ -397,7 +401,8 @@ def handlebar(ContextInfo):
             if should_sell:
                 pnl_pct = (current_price - pos.buy_price) / pos.buy_price * 100
                 realized = (current_price - pos.buy_price) * pos.volume
-                ContextInfo.realized_pnl = getattr(ContextInfo, 'realized_pnl', 0.0) + realized
+                # v2 fix: 用 daily_realized_pnl 缓冲，避免 QMT 当天不生效
+                ContextInfo.daily_realized_pnl = getattr(ContextInfo, 'daily_realized_pnl', 0.0) + realized
 
                 # v2: 更新交易统计
                 ContextInfo.trade_count = getattr(ContextInfo, 'trade_count', 0) + 1
@@ -546,7 +551,8 @@ def handlebar(ContextInfo):
                             current_date, stockcode, profit_pct * 100))
                         continue
                     realized = (sell_price - pos.buy_price) * pos.volume
-                    ContextInfo.realized_pnl = getattr(ContextInfo, 'realized_pnl', 0.0) + realized
+                    # v2 fix: 用 daily_realized_pnl 缓冲，避免 QMT 当天不生效
+                    ContextInfo.daily_realized_pnl = getattr(ContextInfo, 'daily_realized_pnl', 0.0) + realized
 
                     # v2: 更新交易统计
                     ContextInfo.trade_count = getattr(ContextInfo, 'trade_count', 0) + 1
@@ -787,7 +793,8 @@ def _log_status(ContextInfo, current_date):
             except Exception:
                 pass
         if total_assets is None:
-            realized_pnl = getattr(ContextInfo, 'realized_pnl', 0)
+            # v2 fix: 加上 daily_realized_pnl，因为 QMT 当天赋值次日才生效
+            realized_pnl = getattr(ContextInfo, 'realized_pnl', 0) + getattr(ContextInfo, 'daily_realized_pnl', 0.0)
             total_assets = ContextInfo.capital + realized_pnl
         # v2: 扣除累计交易成本
         total_assets -= total_cost_acc
@@ -903,7 +910,8 @@ def _log_status(ContextInfo, current_date):
         except Exception:
             pass
     if total_assets is None:
-        realized_pnl = getattr(ContextInfo, 'realized_pnl', 0)
+        # v2 fix: 加上 daily_realized_pnl，因为 QMT 当天赋值次日才生效
+        realized_pnl = getattr(ContextInfo, 'realized_pnl', 0) + getattr(ContextInfo, 'daily_realized_pnl', 0.0)
         # v2: 修正总资产 = 初始资金 + 已实现盈亏 + 当前浮动盈亏 - 累计交易成本
         # total_pnl 包含了 holding_pnl + sold_pnl，而 realized_pnl 也包含了 sold_pnl
         # 所以要去掉 sold_pnl 避免重复计算
