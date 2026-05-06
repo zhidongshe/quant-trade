@@ -19,6 +19,15 @@ import numpy as np
 import os
 from datetime import datetime
 
+# ==================== 全局配置 ====================
+
+MAX_POSITIONS = 5
+HARD_STOP_PCT = 0.05
+PROFIT_THRESHOLD = 0.10
+TRAILING_PULLBACK_PCT = 0.08
+REBALANCE_INTERVAL = 10  # 每10个交易日换仓（约2周）
+SKIP_HISTORY_WARMUP = True  # 实盘设为True：跳过QMT历史回放；回测设为False
+
 # ==================== 日志模块 ====================
 
 _LOG_FILE_PATH = None
@@ -45,7 +54,6 @@ def _log(msg):
         pass
 
 
-_init_log()
 
 
 # ==================== 指标计算模块 ====================
@@ -175,20 +183,10 @@ def check_trailing_stop(pos, current_price, profit_threshold=0.05, pullback_pct=
     return False
 
 
-def calculate_buy_amount(total_capital, available_cash, max_positions=5):
-    target_per_stock = total_capital / max_positions
+def calculate_buy_amount(total_assets, available_cash, max_positions=5):
+    target_per_stock = total_assets / max_positions
     amount = min(target_per_stock, available_cash)
-    return int(amount // 100 * 100)
-
-
-# ==================== 全局配置 ====================
-
-MAX_POSITIONS = 5
-HARD_STOP_PCT = 0.05
-PROFIT_THRESHOLD = 0.10
-TRAILING_PULLBACK_PCT = 0.08
-REBALANCE_INTERVAL = 10  # 每10个交易日换仓（约2周）
-MIN_HOLD_DAYS = 3       # 最低持有3个交易日
+    return amount
 
 
 # ==================== QMT策略主函数 ====================
@@ -215,6 +213,15 @@ def init(ContextInfo):
     ContextInfo.realized_pnl = 0.0  # 累计已实现盈亏（用于回测时估算总资产）
     ContextInfo.total_cost = 0.0    # 累计交易成本
     ContextInfo.trading_day_index = 0  # 交易日计数器（用于最低持有期）
+    ContextInfo.market_ok_streak = 1   # 大盘连续OK天数，≥2才允许买入
+    ContextInfo.market_weak_streak = 0 # 大盘连续弱天数，≥2则清仓非强势股
+    ContextInfo.strategy_start_date = datetime.now().strftime('%Y%m%d')  # 记录启动日期，用于过滤QMT历史回放
+
+    # 初始化日志文件名（实盘/回测用 SKIP_HISTORY_WARMUP 区分）
+    global _LOG_FILE_PATH
+    mode_str = '实盘' if SKIP_HISTORY_WARMUP else '回测'
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    _LOG_FILE_PATH = r'c:\量化日志_{0}_{1}.log'.format(mode_str, ts)
 
     universe = ContextInfo.get_sector('000300.SH')
     if universe:
@@ -238,13 +245,25 @@ def _normalize_stock_code(code):
 
 
 def _check_market_trend(idx_prices):
-    """判断大盘是否在上升趋势：沪深300 close > MA20 且 MACD hist > 0
-    idx_prices: 指数近25日收盘价数组（numpy array 或 list）
+    """判断大盘是否在上升趋势：沪深300 close > MA20 且 MACD hist > 0 且未暴跌
+    idx_prices: 指数近70日收盘价数组（numpy array 或 list）
     """
     if idx_prices is None or len(idx_prices) < 20:
         return False
+
+    # 1. 单日暴跌保护：跌幅超过3%认为大盘不满足上升趋势
+    if len(idx_prices) >= 2:
+        daily_change = (idx_prices[-1] - idx_prices[-2]) / idx_prices[-2]
+        if daily_change <= -0.03:
+            return False
+
     ma20 = np.mean(idx_prices[-20:])
     dif, dea, hist = macd(np.array(idx_prices, dtype=float))
+
+    # 2. MACD红柱缩窄保护：拒绝多头衰竭信号
+    #if len(hist) >= 2 and hist[-1] <= hist[-2]:
+    #    return False
+
     return idx_prices[-1] > ma20 and hist[-1] > 0
 
 
@@ -293,9 +312,118 @@ def _sync_positions(ContextInfo, account_id, account_type, current_date):
         _log("[{0}] 持仓同步异常: {1}".format(current_date, e))
 
 
+def _realtime_stop_loss_check(ContextInfo, account_id, current_date):
+    """盘中实时监控止损止盈（5分钟级别），每个bar执行一次"""
+    if len(ContextInfo.positions) == 0:
+        return
+
+    # 获取5分钟价格数据（最近20根，用于计算5分钟MA20和单根跌幅）
+    min5_prices = ContextInfo.get_history_data(20, '5m', 'close', dividend_type='front', skip_paused=True)
+    if not min5_prices:
+        return
+
+    for stockcode, pos in list(ContextInfo.positions.items()):
+        if stockcode not in min5_prices or len(min5_prices[stockcode]) < 1:
+            continue
+
+        prices_list = min5_prices[stockcode]
+        current_price = float(prices_list[-1])
+
+        # 更新highest_price用于跟踪止盈
+        if current_price > pos.highest_price:
+            pos.highest_price = current_price
+
+        should_sell = False
+        sell_reason = ''
+
+        # 1. 硬止损
+        if check_stop_loss(pos, current_price, HARD_STOP_PCT):
+            should_sell = True
+            sell_reason = 'hard_stop'
+
+        # 2. 5分钟暴跌保护（单根5分钟K线跌超4%，避免2%过于敏感）
+        elif len(prices_list) >= 2:
+            prev_price = float(prices_list[-2])
+            min5_change = (current_price - prev_price) / prev_price if prev_price > 0 else 0
+            if min5_change <= -0.04:
+                should_sell = True
+                sell_reason = 'min5_crash'
+
+        # 3. 跟踪止盈
+        if not should_sell:
+            if check_trailing_stop(pos, current_price, PROFIT_THRESHOLD, TRAILING_PULLBACK_PCT):
+                should_sell = True
+                sell_reason = 'trailing_stop'
+
+        # 4. 5分钟趋势破坏（跌破5分钟MA20）
+        if not should_sell and len(prices_list) >= 20:
+            ma20_5m = np.mean(np.array(prices_list[-20:], dtype=float))
+            if current_price <= ma20_5m:
+                should_sell = True
+                sell_reason = 'trend_break_5m'
+
+        if should_sell:
+            pnl_pct = (current_price - pos.buy_price) / pos.buy_price * 100
+            _log("[{0}] [实时监控] 触发卖出: {1} | 原因: {2} | 买入价: {3:.2f} | 现价: {4:.2f} | 盈亏: {5:+.2f}%".format(
+                current_date, stockcode, sell_reason, pos.buy_price, current_price, pnl_pct))
+
+            # 记录当日卖出
+            daily_sold_records = getattr(ContextInfo, 'daily_sold_records', [])
+            ContextInfo.daily_sold_records = daily_sold_records
+            daily_sold_records.append({
+                'stockcode': stockcode,
+                'volume': pos.volume,
+                'buy_price': pos.buy_price,
+                'sell_price': current_price,
+                'reason': sell_reason,
+                'buy_date': pos.buy_date,
+            })
+
+            # 计算卖出交易成本
+            amount = pos.volume * current_price
+            commission = max(amount * 0.0001, 5.0)
+            stamp_tax = amount * 0.001
+            transfer_fee = amount * 0.00001
+            slippage = amount * 0.0005
+            total_cost = commission + stamp_tax + transfer_fee + slippage
+            ContextInfo.daily_cost = getattr(ContextInfo, 'daily_cost', 0.0) + total_cost
+
+            # 执行卖出
+            _execute_sell(ContextInfo, account_id, 'STOCK', stockcode, sell_reason, current_date, price=current_price)
+            if stockcode in ContextInfo.positions:
+                del ContextInfo.positions[stockcode]
+
+
 def handlebar(ContextInfo):
     current_date = timetag_to_datetime(ContextInfo.get_bar_timetag(ContextInfo.barpos), '%Y%m%d')
+    current_time = timetag_to_datetime(ContextInfo.get_bar_timetag(ContextInfo.barpos), '%H:%M:%S')
+    _log("[{0}] {1} 收到bar数据".format(current_date, current_time))
 
+    # 跳过QMT历史回放数据（仅实盘时开启）
+    if SKIP_HISTORY_WARMUP:
+        start_date = getattr(ContextInfo, 'strategy_start_date', '20990101')
+        if current_date < start_date:
+            _log("[{0}] 跳过QMT历史回放数据".format(current_date))
+            return
+
+    # 幂等：同一个 bar 只处理一次，防止 QMT 重复触发
+    current_bar = ContextInfo.barpos
+    last_bar = getattr(ContextInfo, 'last_processed_barpos', -1)
+    if current_bar <= last_bar:
+        _log("[{0}] 跳过重复的bar数据".format(current_bar))
+        return
+    ContextInfo.last_processed_barpos = current_bar
+
+    # 从QMT实际持仓同步，防止positions字典和QMT脱节（每个bar都同步）
+    account_id = ContextInfo.accountid if hasattr(ContextInfo, 'accountid') else ''
+    _sync_positions(ContextInfo, account_id, 'STOCK', current_date)
+
+    # ==== 盘中实时监控止损止盈（5分钟级别）====
+    _realtime_stop_loss_check(ContextInfo, account_id, current_date)
+
+    # ==== 每日交易逻辑：只在开盘09:35执行一次（基于日线数据选股、换仓、买入）====
+    if current_time < '09:35:00':
+        return
     if ContextInfo.last_trade_date == current_date:
         return
     ContextInfo.last_trade_date = current_date
@@ -304,9 +432,8 @@ def handlebar(ContextInfo):
     ContextInfo.daily_sold_records = []
     ContextInfo.daily_cost = 0.0
 
-    # 从QMT实际持仓同步，防止positions字典和QMT脱节
-    account_id = ContextInfo.accountid if hasattr(ContextInfo, 'accountid') else ''
-    _sync_positions(ContextInfo, account_id, 'STOCK', current_date)
+    # 获取5分钟当前价格（用于买入和换仓卖出参考）
+    min5_prices = ContextInfo.get_history_data(1, '5m', 'close', dividend_type='front', skip_paused=True)
 
     # 交易日计数 + 换仓日判断提前（卖出逻辑需要）
     ContextInfo.trading_day_index = getattr(ContextInfo, 'trading_day_index', 0) + 1
@@ -332,18 +459,12 @@ def handlebar(ContextInfo):
         _log("[{0}] set_universe: 补充{1}只持仓股进 universe".format(current_date, len(missing)))
 
     # 过滤ST股（只过滤买入池，不影响卖出），并排除指数本身
-    buy_universe = [code for code in _filter_st_stocks(universe, ContextInfo) if code != '000300.SH']
+    buy_universe = [code for code in _filter_st_stocks(universe, ContextInfo)
+                    if code != '000300.SH' and not code.startswith('688')]
 
-    # 2. 获取账户信息
     account_type = 'STOCK'
 
-    available_cash = ContextInfo.capital
-    if account_id:
-        acct_info = get_trade_detail_data(account_id, account_type, 'ACCOUNT')
-        if acct_info:
-            available_cash = acct_info[0].m_dAvailable
-
-    # 3. 遍历现有持仓，检查止损/止盈
+    # 2. 遍历现有持仓，检查止损/止盈
     positions_to_sell = []
     hist_prices = ContextInfo.get_history_data(70, '1d', 'close', dividend_type='front', skip_paused=True)
 
@@ -352,66 +473,39 @@ def handlebar(ContextInfo):
     if '000300.SH' in hist_prices and len(hist_prices['000300.SH']) >= 70:
         idx_prices = np.array(hist_prices['000300.SH'], dtype=float)
     market_ok = _check_market_trend(idx_prices)
-    market_str = "大盘OK" if market_ok else "大盘弱"
+    if market_ok:
+        ContextInfo.market_ok_streak = getattr(ContextInfo, 'market_ok_streak', 0) + 1
+        ContextInfo.market_weak_streak = 0
+    else:
+        ContextInfo.market_ok_streak = 0
+        ContextInfo.market_weak_streak = getattr(ContextInfo, 'market_weak_streak', 0) + 1
+    market_str = "大盘OK({0}天)".format(ContextInfo.market_ok_streak) if market_ok else "大盘弱({0}天)".format(ContextInfo.market_weak_streak)
     _log("[{0}] ===== 日期: {0} | 持仓: {1}只 | {2} | 距下次换仓: {3}个交易日 =====".format(
         current_date, len(holdings), market_str,
         REBALANCE_INTERVAL - ContextInfo.rebalance_count
     ))
 
+    # 硬止损/暴跌/趋势破坏/跟踪止盈 已由 _realtime_stop_loss_check 在5分钟级别实时监控
+    # 此处仅更新 highest_price，供大盘弱势清仓判断使用
     if len(ContextInfo.positions) > 0:
         for stockcode, pos in list(ContextInfo.positions.items()):
             if stockcode not in hist_prices or len(hist_prices[stockcode]) < 1:
-                _log("[{0}] {1} 跳过卖出: 无数据".format(current_date, stockcode))
                 continue
-
-            prices_list = hist_prices[stockcode]
-            current_price = float(prices_list[-1])
-
-            # 更新highest_price用于跟踪止盈
+            current_price = float(hist_prices[stockcode][-1])
             if current_price > pos.highest_price:
                 pos.highest_price = current_price
 
-            # 数据不足20条时，只能检查硬止损
-            if len(prices_list) < 20:
-                if check_stop_loss(pos, current_price, HARD_STOP_PCT):
-                    positions_to_sell.append((stockcode, 'hard_stop'))
+    # 大盘连续2天弱，清仓非强势股（保留已进入跟踪止盈区间的股票）
+    if ContextInfo.market_weak_streak >= 2:
+        already_marked = {s for s, _ in positions_to_sell}
+        for stockcode, pos in list(ContextInfo.positions.items()):
+            if stockcode in already_marked:
                 continue
-
-            prices_arr = np.array(prices_list)
-            ma20 = np.mean(prices_arr[-20:])
-
-            # 计算持有交易日数
-            hold_days = ContextInfo.trading_day_index - getattr(pos, 'buy_trading_day_idx', 0)
-
-            should_sell = False
-            sell_reason = ''
-
-            # 硬止损始终检查（无论是否最低持有期）
-            if check_stop_loss(pos, current_price, HARD_STOP_PCT):
-                should_sell = True
-                sell_reason = 'hard_stop'
-            # 单日暴跌保护：绕过最低持有期，防止次日暴跌无法出逃
-            elif len(prices_list) >= 2:
-                prev_price = float(prices_list[-2])
-                daily_change = (current_price - prev_price) / prev_price if prev_price > 0 else 0
-                if daily_change <= -0.07 or current_price <= pos.buy_price * 0.93:
-                    should_sell = True
-                    sell_reason = 'crash_protection'
-            # 最低持有期内不检查趋势破坏和跟踪止盈
-            elif hold_days >= MIN_HOLD_DAYS:
-                # 换仓日才检查趋势破坏；非换仓日只检查跟踪止盈
-                if is_rebalance_day and check_trend_break(current_price, ma20):
-                    should_sell = True
-                    sell_reason = 'trend_break'
-                elif check_trailing_stop(pos, current_price, PROFIT_THRESHOLD, TRAILING_PULLBACK_PCT):
-                    should_sell = True
-                    sell_reason = 'trailing_stop'
-
-            if should_sell:
-                pnl_pct = (current_price - pos.buy_price) / pos.buy_price * 100
-                _log("[{0}] 触发卖出: {1} | 原因: {2} | 持有{3}天 | 买入价: {4:.2f} | 现价: {5:.2f} | 盈亏: {6:+.2f}%".format(
-                    current_date, stockcode, sell_reason, hold_days, pos.buy_price, current_price, pnl_pct))
-                positions_to_sell.append((stockcode, sell_reason))
+            max_profit_pct = (pos.highest_price - pos.buy_price) / pos.buy_price
+            if max_profit_pct <= PROFIT_THRESHOLD:
+                positions_to_sell.append((stockcode, 'market_weak'))
+                _log("[{0}] 大盘连续弱{1}天，清仓: {2} | 最高盈利{3:+.2f}%，未达强势股标准".format(
+                    current_date, ContextInfo.market_weak_streak, stockcode, max_profit_pct * 100))
 
     # 执行卖出，并记录当日已卖出股票（当天不再买回）
     sold_today = set()
@@ -450,10 +544,27 @@ def handlebar(ContextInfo):
     if not market_ok:
         _log("[{0}] 大盘环境不满足上升趋势，今日禁止买入".format(current_date))
 
+    # 卖出执行完毕后，重新获取账户资金（卖出释放的资金当天可用于买入）
+    realized_pnl = getattr(ContextInfo, 'realized_pnl', 0.0)
+    # 估算当前持仓未实现盈亏（接口不可用时用于估算总资产，与 _log_status 逻辑保持一致）
+    estimated_unrealized = 0.0
+    for code, pos in ContextInfo.positions.items():
+        if code in hist_prices and len(hist_prices[code]) > 0:
+            cur = float(hist_prices[code][-1])
+            estimated_unrealized += (cur - pos.buy_price) * pos.volume
+    estimated_assets = ContextInfo.capital + realized_pnl + estimated_unrealized
+
+    total_assets = estimated_assets
+    available_cash = estimated_assets
     if account_id:
-        acct_info = get_trade_detail_data(account_id, account_type, 'ACCOUNT')
-        if acct_info:
-            available_cash = acct_info[0].m_dAvailable
+        try:
+            acct_info = get_trade_detail_data(account_id, account_type, 'ACCOUNT')
+            if acct_info:
+                available_cash = acct_info[0].m_dAvailable
+                total_assets = acct_info[0].m_dBalance
+        except Exception:
+            pass
+    _log("[{0}] 总资产: {1:.0f}元 | 可用现金: {2:.0f}元".format(current_date, total_assets, available_cash))
 
     # 一次性获取所有需要的历史数据
     hist_prices = ContextInfo.get_history_data(70, '1d', 'close', dividend_type='front', skip_paused=True)
@@ -550,15 +661,17 @@ def handlebar(ContextInfo):
             if stockcode not in top_codes:
                 pos = ContextInfo.positions[stockcode]
                 sell_price = pos.buy_price
-                if stockcode in hist_prices and len(hist_prices[stockcode]) > 0:
+                if min5_prices and stockcode in min5_prices and len(min5_prices[stockcode]) > 0:
+                    sell_price = float(min5_prices[stockcode][-1])
+                elif stockcode in hist_prices and len(hist_prices[stockcode]) > 0:
                     sell_price = float(hist_prices[stockcode][-1])
-                    profit_pct = (sell_price - pos.buy_price) / pos.buy_price
-                    if profit_pct > PROFIT_THRESHOLD:
-                        _log("[{0}] 换仓保留: {1} | 盈利{2:+.2f}%，不强制卖出".format(
-                            current_date, stockcode, profit_pct * 100))
-                        continue
-                    realized = (sell_price - pos.buy_price) * pos.volume
-                    ContextInfo.realized_pnl = getattr(ContextInfo, 'realized_pnl', 0.0) + realized
+                profit_pct = (sell_price - pos.buy_price) / pos.buy_price
+                if profit_pct > PROFIT_THRESHOLD:
+                    _log("[{0}] 换仓保留: {1} | 盈利{2:+.2f}%，不强制卖出".format(
+                        current_date, stockcode, profit_pct * 100))
+                    continue
+                realized = (sell_price - pos.buy_price) * pos.volume
+                ContextInfo.realized_pnl = getattr(ContextInfo, 'realized_pnl', 0.0) + realized
                 # 记录当日卖出
                 ContextInfo.daily_sold_records.append({
                     'stockcode': stockcode,
@@ -581,8 +694,20 @@ def handlebar(ContextInfo):
                     del ContextInfo.positions[stockcode]
                 sold_today.add(stockcode)
 
-        # 买入新Top N中未持仓的（大盘OK时才买）
-        if market_ok:
+        # 换仓卖出后，再次重新获取账户资金（确保换仓释放的资金用于买入）
+        if account_id:
+            try:
+                acct_info = get_trade_detail_data(account_id, account_type, 'ACCOUNT')
+                if acct_info:
+                    available_cash = acct_info[0].m_dAvailable
+                    total_assets = acct_info[0].m_dBalance
+                    _log("[{0}] 换仓后资金: 总资产{1:.0f}元 | 可用{2:.0f}元".format(
+                        current_date, total_assets, available_cash))
+            except Exception:
+                pass
+
+        # 买入新Top N中未持仓的（大盘连续2天OK才买）
+        if ContextInfo.market_ok_streak >= 2:
             current_holdings = len(ContextInfo.positions)
             for stockcode, s in top_n:
                 if current_holdings >= MAX_POSITIONS:
@@ -595,8 +720,11 @@ def handlebar(ContextInfo):
                     continue
 
                 prices_arr = np.array(hist_prices[stockcode])
-                current_price = float(prices_arr[-1])
-                buy_amount = calculate_buy_amount(ContextInfo.capital, available_cash, MAX_POSITIONS)
+                if min5_prices and stockcode in min5_prices and len(min5_prices[stockcode]) > 0:
+                    current_price = float(min5_prices[stockcode][-1])
+                else:
+                    current_price = float(prices_arr[-1])
+                buy_amount = calculate_buy_amount(total_assets, available_cash, MAX_POSITIONS)
                 if buy_amount < 1000:
                     continue
                 buy_volume = int(buy_amount / current_price / 100) * 100
@@ -605,7 +733,7 @@ def handlebar(ContextInfo):
                         current_date, stockcode, current_price))
                     continue
 
-                success = _execute_buy(ContextInfo, account_id, account_type, stockcode, buy_volume, current_price, current_date, score=s)
+                success, trade_cost = _execute_buy(ContextInfo, account_id, account_type, stockcode, buy_volume, current_price, current_date, score=s)
                 if success:
                     ContextInfo.positions[stockcode] = Position(
                         stockcode=stockcode,
@@ -614,14 +742,22 @@ def handlebar(ContextInfo):
                         volume=buy_volume,
                         buy_trading_day_idx=ContextInfo.trading_day_index
                     )
-                    available_cash -= buy_volume * current_price
+                    available_cash -= buy_volume * current_price + trade_cost
                     current_holdings += 1
+                    # 买入后立即重新获取可用资金（以QMT实际余额为准）
+                    if account_id:
+                        try:
+                            acct_info = get_trade_detail_data(account_id, account_type, 'ACCOUNT')
+                            if acct_info:
+                                available_cash = acct_info[0].m_dAvailable
+                        except Exception:
+                            pass
         else:
             _log("[{0}] 大盘弱势，换仓日跳过买入".format(current_date))
 
     else:
-        # 非换仓日：大盘OK时才补仓
-        if market_ok:
+        # 非换仓日：大盘连续2天OK才补仓
+        if ContextInfo.market_ok_streak >= 2:
             current_holdings = len(ContextInfo.positions)
             cached = getattr(ContextInfo, 'ranked_candidates', (None, []))
             cand_date, candidates = cached
@@ -643,8 +779,11 @@ def handlebar(ContextInfo):
                     if not check_buy_signal(prices_arr, volumes_arr):
                         continue
 
-                    current_price = float(prices_arr[-1])
-                    buy_amount = calculate_buy_amount(ContextInfo.capital, available_cash, MAX_POSITIONS)
+                    if min5_prices and stockcode in min5_prices and len(min5_prices[stockcode]) > 0:
+                        current_price = float(min5_prices[stockcode][-1])
+                    else:
+                        current_price = float(prices_arr[-1])
+                    buy_amount = calculate_buy_amount(total_assets, available_cash, MAX_POSITIONS)
                     if buy_amount < 1000:
                         continue
                     buy_volume = int(buy_amount / current_price / 100) * 100
@@ -653,7 +792,7 @@ def handlebar(ContextInfo):
                             current_date, stockcode, current_price))
                         continue
 
-                    success = _execute_buy(ContextInfo, account_id, account_type, stockcode, buy_volume, current_price, current_date, score=s)
+                    success, trade_cost = _execute_buy(ContextInfo, account_id, account_type, stockcode, buy_volume, current_price, current_date, score=s)
                     if success:
                         ContextInfo.positions[stockcode] = Position(
                             stockcode=stockcode,
@@ -662,8 +801,16 @@ def handlebar(ContextInfo):
                             volume=buy_volume,
                             buy_trading_day_idx=ContextInfo.trading_day_index
                         )
-                        available_cash -= buy_volume * current_price
+                        available_cash -= buy_volume * current_price + trade_cost
                         current_holdings += 1
+                        # 买入后立即重新获取可用资金（以QMT实际余额为准）
+                        if account_id:
+                            try:
+                                acct_info = get_trade_detail_data(account_id, account_type, 'ACCOUNT')
+                                if acct_info:
+                                    available_cash = acct_info[0].m_dAvailable
+                            except Exception:
+                                pass
         else:
             _log("[{0}] 大盘弱势，非换仓日跳过补仓".format(current_date))
 
@@ -707,13 +854,13 @@ def _execute_buy(ContextInfo, account_id, account_type, stockcode, volume, price
         score_str = " | 评分: {0:.4f}".format(score) if score is not None else ""
         _log("[{0}] >> 买入: {1} | {2}股 x {3:.2f}元 = {4:.0f}元 | 交易成本: {5:.2f}元{6}".format(
             trade_date, stockcode, volume, price, amount, total_cost, score_str))
-        return True
+        return True, total_cost
     except Exception as e:
         _log("[{0}] !! 买入失败: {1} | {2}".format(trade_date, stockcode, e))
-        return False
+        return False, 0.0
 
 
-def _execute_sell(ContextInfo, account_id, account_type, stockcode, reason, trade_date):
+def _execute_sell(ContextInfo, account_id, account_type, stockcode, reason, trade_date, price=None):
     try:
         sell_volume = 0
 
@@ -758,14 +905,21 @@ def _execute_sell(ContextInfo, account_id, account_type, stockcode, reason, trad
             'trailing_stop': '跟踪止盈',
             'rebalance': '换仓调出',
             'crash_protection': '暴跌保护',
+            'macd_weak': 'MACD衰竭',
+            'market_weak': '大盘弱势清仓',
+            'min5_crash': '5分钟暴跌',
+            'trend_break_5m': '5分钟破MA20',
         }
         reason_cn = reason_map.get(reason, reason)
         pos = ContextInfo.positions.get(stockcode)
         if pos:
             pnl_pct = 0
-            hist_prices_data = ContextInfo.get_history_data(1, '1d', 'close', dividend_type='front', skip_paused=True)
-            if stockcode in hist_prices_data and len(hist_prices_data[stockcode]) > 0:
-                current_price = float(hist_prices_data[stockcode][-1])
+            current_price = price
+            if current_price is None:
+                hist_prices_data = ContextInfo.get_history_data(1, '1d', 'close', dividend_type='front', skip_paused=True)
+                if stockcode in hist_prices_data and len(hist_prices_data[stockcode]) > 0:
+                    current_price = float(hist_prices_data[stockcode][-1])
+            if current_price is not None:
                 pnl_pct = (current_price - pos.buy_price) / pos.buy_price * 100
             _log("[{0}] << 卖出: {1} | {2}股 | 原因: {3} | 持仓自: {4} | 盈亏: {5:+.2f}%".format(
                 trade_date, stockcode, sell_volume, reason_cn, pos.buy_date, pnl_pct))
@@ -919,7 +1073,10 @@ def _log_status(ContextInfo, current_date):
 
     daily_cost = getattr(ContextInfo, 'daily_cost', 0.0)
     total_cost_acc = getattr(ContextInfo, 'total_cost', 0.0) + daily_cost
+    capital_usage_pct = (total_value / total_assets * 100) if total_assets > 0 else 0
 
-    _log("[{0}] ====== 总资产: {1:.0f}元 | 总盈亏: {2:+.0f}元({3:+.2f}%) | 持仓总市值: {4:.0f}元 | 持仓总盈亏: {5:+.0f}元({6:+.2f}%) | 今日持仓盈亏: {7:+.0f}元({8:+.2f}%) | 资金余额: {9:.0f}元 | 当日交易成本: {10:.2f}元 | 累计交易成本: {11:.2f}元".format(
-        current_date, total_assets, total_profit, total_profit_pct, total_value, total_pnl, total_pnl_pct, total_today_pnl, total_today_pnl_pct, cash_balance, daily_cost, total_cost_acc))
-    _log("================================================")
+    _log("[{0}] ====== 总资产: {1:.0f}元 | 总盈亏: {2:+.0f}元({3:+.2f}%) | 资金余额: {4:.0f}元 | 资金利用率: {5:.1f}%".format(
+        current_date, total_assets, total_profit, total_profit_pct, cash_balance, capital_usage_pct))
+    _log("[{0}] ====== 持仓市值: {1:.0f}元 | 持仓盈亏: {2:+.0f}元({3:+.2f}%) | 今日盈亏: {4:+.0f}元({5:+.2f}%) | 当日成本: {6:.2f}元 | 累计成本: {7:.2f}元".format(
+        current_date, total_value, total_pnl, total_pnl_pct, total_today_pnl, total_today_pnl_pct, daily_cost, total_cost_acc))
+    _log("================================================================================================")
