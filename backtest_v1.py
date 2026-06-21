@@ -213,7 +213,18 @@ class BacktestAccount:
     def submit_order(self, order: Order):
         self.pending_orders.append(order)
 
-    def fill_orders(self, fill_price_provider, stock_name_provider, bar_time):
+    def available_volume(self, code: str) -> int:
+        if code not in self.positions:
+            return 0
+        held = self.positions[code].volume
+        locked = sum(self.t1_locked.get(code, {}).values())
+        return max(held - locked, 0)
+
+    def advance_day(self, new_date: str):
+        """新交易日开始：解锁全部 T+1 持仓"""
+        self.t1_locked.clear()
+
+    def fill_orders(self, fill_price_provider, stock_name_provider, is_limit_up_provider, bar_time):
         # Task 6 里所有 order 都会被 fill 或 reject; unfilled 是给 Task 7 加 T+1 锁定/限价单延迟后留的位
         unfilled = []
         for order in self.pending_orders:
@@ -223,48 +234,69 @@ class BacktestAccount:
                 continue
             slip = self.cost_config.slippage_pct
             if order.side == 'BUY':
+                if is_limit_up_provider(order.code):
+                    self._record_reject(order, 'LIMIT_UP', bar_time, stock_name_provider)
+                    continue
                 fill_price = ref_price * (1 + slip)
-            else:
+                amount = fill_price * order.volume
+                commission = max(amount * self.cost_config.commission_rate, self.cost_config.commission_min)
+                transfer_fee = amount * self.cost_config.transfer_fee_rate if order.code.startswith('SH.') else 0.0
+                total_out = amount + commission + transfer_fee
+                if total_out > self.cash:
+                    self._record_reject(order, 'CASH_SHORT', bar_time, stock_name_provider)
+                    continue
+                self._execute_buy(order, fill_price, amount, commission, 0.0, transfer_fee, bar_time, stock_name_provider)
+            else:  # SELL
+                avail = self.available_volume(order.code)
+                if avail < order.volume:
+                    self._record_reject(order, 'VOLUME_SHORT', bar_time, stock_name_provider)
+                    continue
                 fill_price = ref_price * (1 - slip)
-            amount = fill_price * order.volume
-            commission = max(amount * self.cost_config.commission_rate, self.cost_config.commission_min)
-            stamp_tax = amount * self.cost_config.stamp_tax_rate if order.side == 'SELL' else 0.0
-            transfer_fee = amount * self.cost_config.transfer_fee_rate if order.code.startswith('SH.') else 0.0
-            total_cost = commission + stamp_tax + transfer_fee
-
-            if order.side == 'BUY':
-                self.cash -= amount + total_cost
-                if order.code in self.positions:
-                    old = self.positions[order.code]
-                    new_vol = old.volume + order.volume
-                    new_avg = (old.open_price * old.volume + fill_price * order.volume) / new_vol
-                    old.volume = new_vol
-                    old.open_price = new_avg
-                    old.market_value = fill_price * new_vol
-                else:
-                    self.positions[order.code] = Position(
-                        code=order.code, volume=order.volume, open_price=fill_price,
-                        open_date=bar_time.strftime('%Y-%m-%d'),
-                        market_value=fill_price * order.volume,
-                    )
-            else:
-                self.cash += amount - total_cost
-                pos = self.positions[order.code]
-                pos.volume -= order.volume
-                if pos.volume <= 0:
-                    del self.positions[order.code]
-                else:
-                    pos.market_value = fill_price * pos.volume
-
-            self.trades.append(Trade(
-                bar_time=bar_time, code=order.code,
-                name=stock_name_provider(order.code),
-                side=order.side, price=fill_price, volume=order.volume,
-                amount=amount, commission=commission, stamp_tax=stamp_tax,
-                transfer_fee=transfer_fee, cash_after=self.cash,
-                reason=order.reason,
-            ))
+                amount = fill_price * order.volume
+                commission = max(amount * self.cost_config.commission_rate, self.cost_config.commission_min)
+                stamp_tax = amount * self.cost_config.stamp_tax_rate
+                transfer_fee = amount * self.cost_config.transfer_fee_rate if order.code.startswith('SH.') else 0.0
+                self._execute_sell(order, fill_price, amount, commission, stamp_tax, transfer_fee, bar_time, stock_name_provider)
         self.pending_orders = unfilled
+
+    def _execute_buy(self, order, fill_price, amount, commission, stamp_tax, transfer_fee, bar_time, name_provider):
+        self.cash -= amount + commission + transfer_fee
+        if order.code in self.positions:
+            old = self.positions[order.code]
+            new_vol = old.volume + order.volume
+            new_avg = (old.open_price * old.volume + fill_price * order.volume) / new_vol
+            old.volume = new_vol
+            old.open_price = new_avg
+            old.market_value = fill_price * new_vol
+        else:
+            self.positions[order.code] = Position(
+                code=order.code, volume=order.volume, open_price=fill_price,
+                open_date=bar_time.strftime('%Y-%m-%d'),
+                market_value=fill_price * order.volume,
+            )
+        # T+1 锁定
+        d = bar_time.strftime('%Y-%m-%d')
+        self.t1_locked.setdefault(order.code, {})
+        self.t1_locked[order.code][d] = self.t1_locked[order.code].get(d, 0) + order.volume
+        self._append_trade(order, fill_price, amount, commission, stamp_tax, transfer_fee, bar_time, name_provider)
+
+    def _execute_sell(self, order, fill_price, amount, commission, stamp_tax, transfer_fee, bar_time, name_provider):
+        self.cash += amount - commission - stamp_tax - transfer_fee
+        pos = self.positions[order.code]
+        pos.volume -= order.volume
+        if pos.volume <= 0:
+            del self.positions[order.code]
+        else:
+            pos.market_value = fill_price * pos.volume
+        self._append_trade(order, fill_price, amount, commission, stamp_tax, transfer_fee, bar_time, name_provider)
+
+    def _append_trade(self, order, fill_price, amount, commission, stamp_tax, transfer_fee, bar_time, name_provider):
+        self.trades.append(Trade(
+            bar_time=bar_time, code=order.code, name=name_provider(order.code),
+            side=order.side, price=fill_price, volume=order.volume,
+            amount=amount, commission=commission, stamp_tax=stamp_tax,
+            transfer_fee=transfer_fee, cash_after=self.cash, reason=order.reason,
+        ))
 
     def _record_reject(self, order, reason_tag, bar_time, name_provider):
         self.trades.append(Trade(
