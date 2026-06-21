@@ -51,6 +51,7 @@ class DataLoader:
         self.daily_df: dict[str, pd.DataFrame] = {}
         self.m5_df: dict[str, pd.DataFrame] = {}  # 后续 task 填
         self._loaded_months: set[str] = set()
+        self.adj_factor: dict[str, pd.Series] = {}
 
     def load_daily(self):
         daily_dir = os.path.join(self.data_root, 'data_a')
@@ -62,6 +63,7 @@ class DataLoader:
             df = df.rename(columns={'turnover': 'volume'})
             df = df.sort_index()
             self.daily_df[code] = df
+        self.compute_adj_factors()
 
     def list_stocks(self) -> list[str]:
         return sorted(self.daily_df.keys())
@@ -97,3 +99,29 @@ class DataLoader:
             mask = df.index.strftime('%Y-%m').isin(keep)
             self.m5_df[code] = df[mask]
         self._loaded_months = {ym for ym in self._loaded_months if ym in keep}
+
+    def compute_adj_factors(self, jump_threshold: float = 0.08):
+        """前复权因子：以最后一日为基准（factor=1.0），向前回推。
+        识别除权：相邻日 close 跳变 > jump_threshold（8%）且方向是下跌（送股/现金分红）。
+        """
+        for code, df in self.daily_df.items():
+            closes = df['close']
+            n = len(closes)
+            factor = pd.Series(1.0, index=closes.index)
+            cumulative = 1.0
+            for i in range(n - 1, 0, -1):
+                today_close = closes.iloc[i]
+                prev_close = closes.iloc[i - 1]
+                ratio = today_close / prev_close - 1
+                if ratio < -jump_threshold:
+                    # 疑似除权：用 today_close/prev_close 作为乘数（小于 1）
+                    cumulative *= today_close / prev_close
+                factor.iloc[i - 1] = cumulative
+            self.adj_factor[code] = factor
+
+    def adjusted(self, code: str, series: pd.Series) -> pd.Series:
+        """对 series 应用前复权（series.index 必须能在 adj_factor 里找到）"""
+        if code not in self.adj_factor:
+            return series
+        f = self.adj_factor[code].reindex(series.index, method='ffill').fillna(1.0)
+        return series * f
