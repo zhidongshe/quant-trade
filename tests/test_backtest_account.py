@@ -25,3 +25,16 @@ def test_snapshot_records_date_and_equity():
     snap = acct.snapshots[0]
     assert snap.date == '2024-01-02'
     assert snap.total_equity == 1_000_000
+
+
+def test_snapshot_positions_are_isolated_from_later_mutations():
+    acct = BacktestAccount(initial_cash=1_000_000, cost_config=CostConfig())
+    pos = Position(code='SH.600000', volume=1000, open_price=9.0,
+                   open_date='2024-01-02', market_value=9000.0)
+    acct.positions['SH.600000'] = pos
+    acct.snapshot('2024-01-02', prices={'SH.600000': 9.0})
+    pos.market_value = 99999.0
+    acct.snapshot('2024-01-03', prices={'SH.600000': 100.0})
+    assert acct.snapshots[0].positions[0].market_value == 9000.0, \
+        '第一个 snapshot 的 position 不应被后续 mutation 污染'
+    assert acct.snapshots[1].positions[0].market_value == 99999.0

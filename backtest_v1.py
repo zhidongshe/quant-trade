@@ -10,7 +10,8 @@ import argparse
 import os
 import glob
 from datetime import datetime
-from dataclasses import dataclass, field
+import dataclasses
+from dataclasses import dataclass
 import pandas as pd
 
 
@@ -205,6 +206,6 @@ class BacktestAccount:
             cash=self.cash,
             total_equity=self.total_equity(prices),
             position_count=len(self.positions),
-            positions=list(self.positions.values()),
+            positions=[dataclasses.replace(p) for p in self.positions.values()],
         )
         self.snapshots.append(snap)
