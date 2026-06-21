@@ -9,7 +9,8 @@ from __future__ import annotations
 import argparse
 import os
 import glob
-from dataclasses import dataclass
+from datetime import datetime
+from dataclasses import dataclass, field
 import pandas as pd
 
 
@@ -125,3 +126,85 @@ class DataLoader:
             return series
         f = self.adj_factor[code].reindex(series.index, method='ffill').fillna(1.0)
         return series * f
+
+
+@dataclass
+class CostConfig:
+    commission_rate: float = 0.0003
+    commission_min: float = 5.0
+    stamp_tax_rate: float = 0.0005
+    transfer_fee_rate: float = 0.00001
+    slippage_pct: float = 0.001
+
+
+@dataclass
+class Position:
+    code: str
+    volume: int
+    open_price: float
+    open_date: str
+    market_value: float
+
+
+@dataclass
+class Order:
+    bar_time: datetime
+    code: str
+    side: str           # 'BUY' | 'SELL'
+    volume: int
+    reason: str
+
+
+@dataclass
+class Trade:
+    bar_time: datetime
+    code: str
+    name: str
+    side: str
+    price: float
+    volume: int
+    amount: float
+    commission: float
+    stamp_tax: float
+    transfer_fee: float
+    cash_after: float
+    reason: str
+
+
+@dataclass
+class Snapshot:
+    date: str
+    cash: float
+    total_equity: float
+    position_count: int
+    positions: list
+
+
+class BacktestAccount:
+    def __init__(self, initial_cash: float, cost_config: CostConfig):
+        self.cash = initial_cash
+        self.cost_config = cost_config
+        self.positions: dict[str, Position] = {}
+        self.pending_orders: list[Order] = []
+        self.trades: list[Trade] = []
+        self.snapshots: list[Snapshot] = []
+        # T+1: {code: {buy_date: volume}}
+        self.t1_locked: dict[str, dict[str, int]] = {}
+
+    def total_equity(self, prices: dict[str, float]) -> float:
+        mv = 0.0
+        for code, pos in self.positions.items():
+            px = prices.get(code, pos.market_value / pos.volume if pos.volume else 0.0)
+            mv += px * pos.volume
+        return self.cash + mv
+
+    def snapshot(self, date: str, prices: dict[str, float] | None = None):
+        prices = prices or {}
+        snap = Snapshot(
+            date=date,
+            cash=self.cash,
+            total_equity=self.total_equity(prices),
+            position_count=len(self.positions),
+            positions=list(self.positions.values()),
+        )
+        self.snapshots.append(snap)
