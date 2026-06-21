@@ -12,6 +12,7 @@ import glob
 from datetime import datetime
 import dataclasses
 from dataclasses import dataclass
+import numpy as np
 import pandas as pd
 
 
@@ -393,3 +394,94 @@ class QMTShim:
             'DownStopPrice': round(pre_close * 0.9, 2),
             'InstrumentName': self._stock_names.get(code, code),
         }
+
+    # ------------------------------------------------------------------
+    # 核心：partial-day bar + history data (Task 9)
+    # ------------------------------------------------------------------
+
+    def _partial_day_bar(self, code: str, day: pd.Timestamp, as_of: datetime, field: str):
+        """构建截至 as_of（含）的当日部分 bar 聚合值。
+        如果没有该日的 5min 数据则返回 None（调用方回退到纯历史数据）。
+        as_of 时刻之后的 bar 严格不包含（防止未来数据泄漏）。
+        """
+        if code not in self.data_loader.m5_df:
+            return None
+        m5 = self.data_loader.m5_df[code]
+        mask = (m5.index.normalize() == day) & (m5.index <= pd.Timestamp(as_of))
+        bars = m5[mask]
+        if len(bars) == 0:
+            return None
+        if field == 'open':
+            return float(bars['open'].iloc[0])
+        if field == 'high':
+            return float(bars['high'].max())
+        if field == 'low':
+            return float(bars['low'].min())
+        if field == 'close':
+            return float(bars['close'].iloc[-1])
+        if field == 'volume':
+            return float(bars['volume'].sum())
+        return None
+
+    def get_history_data(self, N, period='1d', field='close',
+                         dividend_type='front', skip_paused=True):
+        """返回 dict[code, np.ndarray]，共 N 个元素。
+        最后一个元素为当日 partial bar（由 5min 数据聚合，严格不含未来 bar）；
+        如无 5min 数据则返回过去 N 日历史。
+        """
+        if period != '1d':
+            raise NotImplementedError(f'period {period!r} not supported; only "1d" is available')
+        result = {}
+        cur_date = pd.Timestamp(self._bar_time.date())
+        cur_time = self._bar_time
+
+        codes = list(self._universe) if self._universe else self.data_loader.list_stocks()
+        for code in codes:
+            if code not in self.data_loader.daily_df:
+                continue
+            df = self.data_loader.daily_df[code]
+            past = df.loc[df.index < cur_date]
+            col = field if field in past.columns else 'close'
+            past_series = past[col]
+            # 前复权：对历史数据应用调整因子（当日 partial bar 已是最新价，factor=1.0）
+            if dividend_type == 'front':
+                past_series = self.data_loader.adjusted(code, past_series)
+            partial = self._partial_day_bar(code, cur_date, cur_time, field)
+            if partial is None:
+                # 无 5min 数据，只返回历史
+                if len(past_series) < N:
+                    continue
+                arr = past_series.iloc[-N:].to_numpy(dtype=float)
+            else:
+                full = np.concatenate([past_series.to_numpy(dtype=float), [partial]])
+                if len(full) < N:
+                    continue
+                arr = full[-N:]
+            result[code] = arr
+        return result
+
+    def get_market_data_ex(self, fields, codes, period='1d', start_time=None,
+                           end_time=None, count=None, dividend_type='front', fill_data=True):
+        """兼容 v1 调用形态；返回 dict[code, pd.DataFrame]。"""
+        result = {}
+        cur_date = pd.Timestamp(self._bar_time.date())
+        for code in codes:
+            if code not in self.data_loader.daily_df:
+                continue
+            df = self.data_loader.daily_df[code]
+            past = df.loc[df.index < cur_date]
+            partial_close = self._partial_day_bar(code, cur_date, self._bar_time, 'close')
+            if partial_close is not None:
+                row = pd.DataFrame({
+                    'open':   [self._partial_day_bar(code, cur_date, self._bar_time, 'open')],
+                    'high':   [self._partial_day_bar(code, cur_date, self._bar_time, 'high')],
+                    'low':    [self._partial_day_bar(code, cur_date, self._bar_time, 'low')],
+                    'close':  [partial_close],
+                    'volume': [self._partial_day_bar(code, cur_date, self._bar_time, 'volume')],
+                }, index=[cur_date])
+                full = pd.concat([past, row])
+            else:
+                full = past
+            sub = full.tail(count) if count else full
+            result[code] = sub[list(fields)] if fields else sub
+        return result

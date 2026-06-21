@@ -45,3 +45,87 @@ def test_get_instrumentdetail_returns_pre_close():
     assert abs(detail['PreClose'] - 9.15) < 1e-6
     assert abs(detail['UpStopPrice'] - round(9.15 * 1.1, 2)) < 1e-6
     assert detail['InstrumentName'] == '浦发银行'
+
+
+# ---------------------------------------------------------------------------
+# Task 9: get_history_data + partial day bar
+# Fixture: SH.600000_2024-01.txt has full 49 bars for 2024-01-04 (09:35–15:00)
+# Expected values (from deterministic formula close=9.10+0.001*i, high=close+0.05):
+#   bar 09:35 → i=0 → close=9.100, high=9.150
+#   bar 14:55 → i=47 → close=9.147, high=9.197
+#   max_high up to 14:55 (all 48 bars) = high[i=47] = 9.197 (monotone)
+# ---------------------------------------------------------------------------
+EXPECTED_1455_CLOSE = 9.147
+EXPECTED_1455_MAX_HIGH = 9.197
+EXPECTED_0935_HIGH = 9.150
+
+
+def _make_shim_with_5m():
+    """Shim with 5min data for 2024-01 loaded."""
+    shim = _make_shim()
+    shim.data_loader.ensure_month_loaded('2024-01')
+    shim.set_universe(['SH.600000'])
+    return shim
+
+
+def test_get_history_data_returns_past_days_plus_partial_today():
+    """get_history_data(N=3) at 14:55: 2 past days + 1 partial = 3 elements, last = partial close.
+    Fixture has only 3 trading days (2024-01-02, 2024-01-03, 2024-01-04) so N<=3.
+    """
+    import numpy as np
+    shim = _make_shim_with_5m()
+    shim.advance_to(datetime(2024, 1, 4, 14, 55), bar_idx_global=100)
+    res = shim.get_history_data(3, '1d', 'close')
+    arr = res['SH.600000']
+    assert isinstance(arr, np.ndarray), 'result must be numpy array'
+    assert len(arr) == 3
+    assert abs(arr[-1] - EXPECTED_1455_CLOSE) < 1e-3, (
+        f'Last element should be partial-day close {EXPECTED_1455_CLOSE}, got {arr[-1]}'
+    )
+
+
+def test_partial_today_close_equals_current_5m_close():
+    """At 14:55, partial-day close is the 5min bar close at 14:55."""
+    import numpy as np
+    shim = _make_shim_with_5m()
+    shim.advance_to(datetime(2024, 1, 4, 14, 55), bar_idx_global=100)
+    res = shim.get_history_data(3, '1d', 'close')
+    arr = res['SH.600000']
+    assert len(arr) == 3
+    # last element = partial today close = 14:55 bar close
+    assert abs(arr[-1] - EXPECTED_1455_CLOSE) < 1e-3
+
+
+def test_partial_today_high_is_max_of_5m_high_so_far():
+    """At 14:55, today's high = max of all 5min bar highs up to 14:55."""
+    import numpy as np
+    shim = _make_shim_with_5m()
+    shim.advance_to(datetime(2024, 1, 4, 14, 55), bar_idx_global=100)
+    res = shim.get_history_data(3, '1d', 'high')
+    arr = res['SH.600000']
+    # max high across all 48 bars i=0..47: high = 9.10+0.001*i+0.05, max at i=47 = 9.197
+    assert abs(arr[-1] - EXPECTED_1455_MAX_HIGH) < 1e-3, (
+        f'Expected max high {EXPECTED_1455_MAX_HIGH}, got {arr[-1]}'
+    )
+
+
+def test_history_excludes_future_bars():
+    """At 09:35, today's high must equal only the 09:35 bar high (no future bars)."""
+    import numpy as np
+    shim = _make_shim_with_5m()
+    shim.advance_to(datetime(2024, 1, 4, 9, 35), bar_idx_global=50)
+    res = shim.get_history_data(3, '1d', 'high')
+    arr = res['SH.600000']
+    # Only the 09:35 bar (i=0, high=9.150) is visible; later bars must NOT be included
+    assert abs(arr[-1] - EXPECTED_0935_HIGH) < 1e-3, (
+        f'Expected high {EXPECTED_0935_HIGH} (09:35 only), got {arr[-1]}'
+    )
+
+
+def test_get_history_data_raises_for_non_1d():
+    """get_history_data with period!='1d' must raise NotImplementedError."""
+    import pytest
+    shim = _make_shim_with_5m()
+    shim.advance_to(datetime(2024, 1, 4, 14, 55), bar_idx_global=100)
+    with pytest.raises(NotImplementedError):
+        shim.get_history_data(5, '5m', 'close')

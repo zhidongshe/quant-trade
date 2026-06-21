@@ -21,7 +21,8 @@ def test_ensure_month_loaded_brings_in_data():
     loader.ensure_month_loaded('2024-01')
     assert 'SH.600000' in loader.m5_df
     df = loader.m5_df['SH.600000']
-    assert len(df) == 2
+    # fixture: 2 bars for 2024-01-02 + 49 bars for 2024-01-04 = 51
+    assert len(df) == 51
     assert df.index[0] == pd.Timestamp('2024-01-02 09:35:00')
 
 def test_ensure_month_loaded_keeps_current_and_prev_only():
