@@ -214,6 +214,7 @@ class BacktestAccount:
         self.pending_orders.append(order)
 
     def fill_orders(self, fill_price_provider, stock_name_provider, bar_time):
+        # Task 6 里所有 order 都会被 fill 或 reject; unfilled 是给 Task 7 加 T+1 锁定/限价单延迟后留的位
         unfilled = []
         for order in self.pending_orders:
             ref_price = fill_price_provider(order.code)
