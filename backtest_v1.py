@@ -7,7 +7,10 @@
 
 from __future__ import annotations
 import argparse
+import os
+import glob
 from dataclasses import dataclass
+import pandas as pd
 
 
 @dataclass
@@ -40,3 +43,24 @@ class BacktestConfig:
         p.add_argument('--verbose', action='store_true', default=cls.verbose)
         ns = p.parse_args(argv)
         return cls(**vars(ns))
+
+
+class DataLoader:
+    def __init__(self, data_root: str = '300data'):
+        self.data_root = data_root
+        self.daily_df: dict[str, pd.DataFrame] = {}
+        self.m5_df: dict[str, pd.DataFrame] = {}  # 后续 task 填
+
+    def load_daily(self):
+        daily_dir = os.path.join(self.data_root, 'data_a')
+        for path in glob.glob(os.path.join(daily_dir, '*_day.txt')):
+            code = os.path.basename(path).replace('_day.txt', '')
+            raw = pd.read_csv(path)
+            raw['time_key'] = pd.to_datetime(raw['time_key'])
+            df = raw.set_index('time_key')[['open', 'high', 'low', 'close', 'turnover']]
+            df = df.rename(columns={'turnover': 'volume'})
+            df = df.sort_index()
+            self.daily_df[code] = df
+
+    def list_stocks(self) -> list[str]:
+        return sorted(self.daily_df.keys())
