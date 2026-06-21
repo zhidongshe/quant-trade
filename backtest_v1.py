@@ -54,6 +54,7 @@ class DataLoader:
         self.m5_df: dict[str, pd.DataFrame] = {}  # 后续 task 填
         self._loaded_months: set[str] = set()
         self.adj_factor: dict[str, pd.Series] = {}
+        self._stock_names_buffer: dict[str, str] = {}
 
     def load_daily(self):
         daily_dir = os.path.join(self.data_root, 'data_a')
@@ -65,6 +66,8 @@ class DataLoader:
             df = df.rename(columns={'turnover': 'volume'})
             df = df.sort_index()
             self.daily_df[code] = df
+            if 'name' in raw.columns and len(raw) > 0:
+                self._stock_names_buffer[code] = raw['name'].iloc[0]
         self.compute_adj_factors()
 
     def list_stocks(self) -> list[str]:
@@ -305,3 +308,88 @@ class BacktestAccount:
             amount=0.0, commission=0.0, stamp_tax=0.0, transfer_fee=0.0,
             cash_after=self.cash, reason=f'{order.reason}|{reason_tag}',
         ))
+
+
+def timetag_to_datetime(timetag, fmt):
+    """将毫秒级时间戳转换为格式化字符串"""
+    return datetime.fromtimestamp(timetag / 1000).strftime(fmt)
+
+
+class QMTShim:
+    """仿真 QMT ContextInfo，让 v1 策略不改代码直接跑"""
+
+    def __init__(self, data_loader: DataLoader, account: BacktestAccount):
+        self.data_loader = data_loader
+        self.account = account
+
+        # v1 用到的 ContextInfo 属性
+        self.barpos = -1
+        self.last_processed_barpos = -1
+        self.accountid = ''
+        self.capital = 0.0
+        self.positions: dict = {}
+        self.persisted_state: dict = {}
+        self.last_trade_date = None
+        self.rebalance_count = 0
+        self.last_rebalance_date = None
+        self.ranked_candidates = []
+        self.realized_pnl = 0.0
+        self.total_cost = 0.0
+        self.trading_day_index = 0
+        self.market_ok_streak = 0
+        self.market_weak_streak = 0
+        self.strategy_start_date = ''
+        self.daily_sold_records = []
+        self.daily_cost = 0.0
+
+        self._universe: set[str] = set()
+        self._bar_time: datetime | None = None
+        self._bar_timetag_cache: dict[int, int] = {}
+
+        # 从 DataLoader 读取股票名
+        self._stock_names: dict[str, str] = getattr(data_loader, '_stock_names_buffer', {})
+
+    def advance_to(self, bar_time: datetime, bar_idx_global: int):
+        """推进到指定 bar 时刻；缓存 timetag"""
+        self.barpos = bar_idx_global
+        self._bar_time = bar_time
+        self._bar_timetag_cache[bar_idx_global] = int(bar_time.timestamp() * 1000)
+
+    def get_bar_timetag(self, barpos: int) -> int:
+        """获取指定 barpos 的毫秒级时间戳"""
+        return self._bar_timetag_cache[barpos]
+
+    def is_last_bar(self) -> bool:
+        """日级策略总是最后一根 bar"""
+        return True
+
+    def set_universe(self, codes):
+        """设置交易宇宙"""
+        self._universe = set(codes)
+
+    def set_account(self, acct_id):
+        """设置账户 ID"""
+        self.accountid = str(acct_id)
+
+    def get_sector(self, name: str):
+        """获取行业成分股：所有加载的非指数股票"""
+        return [c for c in self.data_loader.list_stocks() if c != 'SH.000300']
+
+    def get_instrumentdetail(self, code: str) -> dict:
+        """获取股票详情（前一日 close/limit prices + 名字）"""
+        if code not in self.data_loader.daily_df:
+            return {}
+        df = self.data_loader.daily_df[code]
+        if self._bar_time is None:
+            return {}
+        cur = pd.Timestamp(self._bar_time.date())
+        prev_idx = df.index[df.index < cur]
+        if len(prev_idx) == 0:
+            return {}
+        pre_close = df.loc[prev_idx[-1], 'close']
+        return {
+            'PreClose': pre_close,
+            'UpStopPrice': round(pre_close * 1.1, 2),
+            'DownStopPrice': round(pre_close * 0.9, 2),
+            'InstrumentName': self._stock_names.get(code, code),
+        }
