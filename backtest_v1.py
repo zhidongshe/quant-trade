@@ -50,6 +50,7 @@ class DataLoader:
         self.data_root = data_root
         self.daily_df: dict[str, pd.DataFrame] = {}
         self.m5_df: dict[str, pd.DataFrame] = {}  # 后续 task 填
+        self._loaded_months: set[str] = set()
 
     def load_daily(self):
         daily_dir = os.path.join(self.data_root, 'data_a')
@@ -64,3 +65,35 @@ class DataLoader:
 
     def list_stocks(self) -> list[str]:
         return sorted(self.daily_df.keys())
+
+    def ensure_month_loaded(self, year_month: str):
+        """加载 year_month（'YYYY-MM'）；释放窗口外（仅保留 current + prev）。"""
+        if year_month in self._loaded_months:
+            return
+        m5_dir = os.path.join(self.data_root, 'data_a_5m')
+        pattern = os.path.join(m5_dir, '*_{0}.txt'.format(year_month))
+        for path in glob.glob(pattern):
+            fname = os.path.basename(path)
+            code = fname.rsplit('_', 1)[0]  # 'SH.600000'
+            raw = pd.read_csv(path)
+            raw['time_key'] = pd.to_datetime(raw['time_key'])
+            df = raw.set_index('time_key')[['open', 'high', 'low', 'close', 'turnover']]
+            df = df.rename(columns={'turnover': 'volume'}).sort_index()
+            if code in self.m5_df:
+                self.m5_df[code] = pd.concat([self.m5_df[code], df]).sort_index()
+            else:
+                self.m5_df[code] = df
+        self._loaded_months.add(year_month)
+        self._evict_old_months(year_month)
+
+    def _evict_old_months(self, current_ym: str):
+        from datetime import datetime
+        cur = datetime.strptime(current_ym, '%Y-%m')
+        prev_year = cur.year if cur.month > 1 else cur.year - 1
+        prev_month = cur.month - 1 if cur.month > 1 else 12
+        keep = {current_ym, '{0:04d}-{1:02d}'.format(prev_year, prev_month)}
+        for code in list(self.m5_df.keys()):
+            df = self.m5_df[code]
+            mask = df.index.strftime('%Y-%m').isin(keep)
+            self.m5_df[code] = df[mask]
+        self._loaded_months = {ym for ym in self._loaded_months if ym in keep}
