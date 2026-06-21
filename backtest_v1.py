@@ -209,3 +209,66 @@ class BacktestAccount:
             positions=[dataclasses.replace(p) for p in self.positions.values()],
         )
         self.snapshots.append(snap)
+
+    def submit_order(self, order: Order):
+        self.pending_orders.append(order)
+
+    def fill_orders(self, fill_price_provider, stock_name_provider, bar_time):
+        unfilled = []
+        for order in self.pending_orders:
+            ref_price = fill_price_provider(order.code)
+            if ref_price is None or ref_price <= 0:
+                self._record_reject(order, 'NO_PRICE', bar_time, stock_name_provider)
+                continue
+            slip = self.cost_config.slippage_pct
+            if order.side == 'BUY':
+                fill_price = ref_price * (1 + slip)
+            else:
+                fill_price = ref_price * (1 - slip)
+            amount = fill_price * order.volume
+            commission = max(amount * self.cost_config.commission_rate, self.cost_config.commission_min)
+            stamp_tax = amount * self.cost_config.stamp_tax_rate if order.side == 'SELL' else 0.0
+            transfer_fee = amount * self.cost_config.transfer_fee_rate if order.code.startswith('SH.') else 0.0
+            total_cost = commission + stamp_tax + transfer_fee
+
+            if order.side == 'BUY':
+                self.cash -= amount + total_cost
+                if order.code in self.positions:
+                    old = self.positions[order.code]
+                    new_vol = old.volume + order.volume
+                    new_avg = (old.open_price * old.volume + fill_price * order.volume) / new_vol
+                    old.volume = new_vol
+                    old.open_price = new_avg
+                    old.market_value = fill_price * new_vol
+                else:
+                    self.positions[order.code] = Position(
+                        code=order.code, volume=order.volume, open_price=fill_price,
+                        open_date=bar_time.strftime('%Y-%m-%d'),
+                        market_value=fill_price * order.volume,
+                    )
+            else:
+                self.cash += amount - total_cost
+                pos = self.positions[order.code]
+                pos.volume -= order.volume
+                if pos.volume <= 0:
+                    del self.positions[order.code]
+                else:
+                    pos.market_value = fill_price * pos.volume
+
+            self.trades.append(Trade(
+                bar_time=bar_time, code=order.code,
+                name=stock_name_provider(order.code),
+                side=order.side, price=fill_price, volume=order.volume,
+                amount=amount, commission=commission, stamp_tax=stamp_tax,
+                transfer_fee=transfer_fee, cash_after=self.cash,
+                reason=order.reason,
+            ))
+        self.pending_orders = unfilled
+
+    def _record_reject(self, order, reason_tag, bar_time, name_provider):
+        self.trades.append(Trade(
+            bar_time=bar_time, code=order.code, name=name_provider(order.code),
+            side=f'{order.side}_REJECTED', price=0.0, volume=order.volume,
+            amount=0.0, commission=0.0, stamp_tax=0.0, transfer_fee=0.0,
+            cash_after=self.cash, reason=f'{order.reason}|{reason_tag}',
+        ))
