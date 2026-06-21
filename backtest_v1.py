@@ -225,9 +225,9 @@ class BacktestAccount:
         self.t1_locked.clear()
 
     def fill_orders(self, fill_price_provider, stock_name_provider, is_limit_up_provider, bar_time):
-        # Task 6 里所有 order 都会被 fill 或 reject; unfilled 是给 Task 7 加 T+1 锁定/限价单延迟后留的位
-        unfilled = []
         for order in self.pending_orders:
+            if order.volume <= 0:
+                continue
             ref_price = fill_price_provider(order.code)
             if ref_price is None or ref_price <= 0:
                 self._record_reject(order, 'NO_PRICE', bar_time, stock_name_provider)
@@ -257,7 +257,7 @@ class BacktestAccount:
                 stamp_tax = amount * self.cost_config.stamp_tax_rate
                 transfer_fee = amount * self.cost_config.transfer_fee_rate if order.code.startswith('SH.') else 0.0
                 self._execute_sell(order, fill_price, amount, commission, stamp_tax, transfer_fee, bar_time, stock_name_provider)
-        self.pending_orders = unfilled
+        self.pending_orders = []
 
     def _execute_buy(self, order, fill_price, amount, commission, stamp_tax, transfer_fee, bar_time, name_provider):
         self.cash -= amount + commission + transfer_fee
