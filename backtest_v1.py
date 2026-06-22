@@ -578,3 +578,42 @@ def load_v1_module(path: str, injected_globals: dict) -> types.ModuleType:
     code = compile(source, path, 'exec')
     exec(code, mod.__dict__)
     return mod
+
+
+class EventLoop:
+    """Drives bar advancement for backtesting.
+
+    Iterates over trading days × 5min bars, calling a handler per bar.
+    Trading days are derived from a source stock's daily index (default SH.000300).
+    """
+
+    def __init__(self, data_loader, shim, account, config, handler,
+                 trading_day_source='SH.000300'):
+        self.data_loader = data_loader
+        self.shim = shim
+        self.account = account
+        self.config = config
+        self.handler = handler
+        self.trading_day_source = trading_day_source
+        self._global_bar_idx = 0
+
+    def run(self):
+        """Iterate trading days and 5min bars, calling handler per bar."""
+        start = pd.Timestamp(self.config.start_date)
+        end = pd.Timestamp(self.config.end_date)
+        source_df = self.data_loader.daily_df[self.trading_day_source]
+        trading_days = source_df.loc[start:end].index.tolist()
+
+        for day in trading_days:
+            ym = day.strftime('%Y-%m')
+            self.data_loader.ensure_month_loaded(ym)
+            self.account.advance_day(day.strftime('%Y-%m-%d'))
+
+            m5 = self.data_loader.m5_df.get(self.trading_day_source)
+            if m5 is None:
+                continue
+            day_bars = m5[m5.index.normalize() == day]
+            for bar_ts in day_bars.index:
+                self.shim.advance_to(bar_ts.to_pydatetime(), self._global_bar_idx)
+                self.handler(self.shim)
+                self._global_bar_idx += 1
