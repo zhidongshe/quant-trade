@@ -44,7 +44,7 @@ def test_event_loop_buy_then_sell_flow():
 
     def handler(s):
         if s._bar_time.strftime('%H:%M') == '09:35':
-            s.passorder(23, 1101, 'X', 'SH.600000', 5, 0, 1000, '', 1, '买', 1)
+            s.passorder(23, 1101, 'X', '600000.SH', 5, 0, 1000, '', 1, '买', 1)
         # 注：v1 实际不会在 9:35 下单，但本测试是 EventLoop 单元测试，不依赖 v1
 
     loop = EventLoop(loader, shim, acct, cfg, handler, trading_day_source='SH.600000')

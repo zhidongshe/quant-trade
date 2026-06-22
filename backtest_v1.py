@@ -318,6 +318,16 @@ def timetag_to_datetime(timetag, fmt):
     return datetime.fromtimestamp(timetag / 1000).strftime(fmt)
 
 
+def _to_data_code(qmt_code: str) -> str:
+    """Convert '600000.SH' → 'SH.600000'.  No-op for already-data-format ('SH.600000') or codes without a suffix."""
+    if '.' not in qmt_code:
+        return qmt_code
+    a, b = qmt_code.split('.', 1)
+    if b in ('SH', 'SZ'):  # QMT format NUM.EX
+        return b + '.' + a
+    return qmt_code  # already data format (EX.NUM)
+
+
 class QMTShim:
     """仿真 QMT ContextInfo，让 v1 策略不改代码直接跑"""
 
@@ -375,14 +385,29 @@ class QMTShim:
         self.accountid = str(acct_id)
 
     def get_sector(self, name: str):
-        """获取行业成分股：所有加载的非指数股票"""
-        return [c for c in self.data_loader.list_stocks() if c != 'SH.000300']
+        """获取行业成分股：所有加载的非指数股票，以 QMT 格式返回
+        name 参数是 QMT 格式（如 '000300.SH'），用于指定要排除的指数代码
+        """
+        name_data_code = _to_data_code(name)  # Convert input from QMT to DataLoader format for lookup
+        result = []
+        for c in self.data_loader.list_stocks():
+            if c == name_data_code:  # Skip the index itself
+                continue
+            if c.startswith('SH.') or c.startswith('SZ.'):
+                ex, num = c.split('.', 1)
+                result.append(num + '.' + ex)
+            else:
+                result.append(c)
+        return result
 
     def get_instrumentdetail(self, code: str) -> dict:
-        """获取股票详情（前一日 close/limit prices + 名字）"""
-        if code not in self.data_loader.daily_df:
+        """获取股票详情（前一日 close/limit prices + 名字）。
+        code 可以是 QMT 格式（'600000.SH'）或 DataLoader 格式（'SH.600000'）。
+        """
+        data_code = _to_data_code(code)
+        if data_code not in self.data_loader.daily_df:
             return {}
-        df = self.data_loader.daily_df[code]
+        df = self.data_loader.daily_df[data_code]
         if self._bar_time is None:
             return {}
         cur = pd.Timestamp(self._bar_time.date())
@@ -394,7 +419,7 @@ class QMTShim:
             'PreClose': pre_close,
             'UpStopPrice': round(pre_close * 1.1, 2),
             'DownStopPrice': round(pre_close * 0.9, 2),
-            'InstrumentName': self._stock_names.get(code, code),
+            'm_strInstrumentName': self._stock_names.get(data_code, code),
         }
 
     # ------------------------------------------------------------------
@@ -427,7 +452,7 @@ class QMTShim:
 
     def get_history_data(self, N, period='1d', field='close',
                          dividend_type='front', skip_paused=True):
-        """返回 dict[code, np.ndarray]，共 N 个元素。
+        """返回 dict[code, np.ndarray]，共 N 个元素，键为 QMT 格式。
         最后一个元素为当日 partial bar（由 5min 数据聚合，严格不含未来 bar）；
         如无 5min 数据则返回过去 N 日历史。
         """
@@ -439,16 +464,17 @@ class QMTShim:
 
         codes = list(self._universe) if self._universe else self.data_loader.list_stocks()
         for code in codes:
-            if code not in self.data_loader.daily_df:
+            data_code = _to_data_code(code)
+            if data_code not in self.data_loader.daily_df:
                 continue
-            df = self.data_loader.daily_df[code]
+            df = self.data_loader.daily_df[data_code]
             past = df.loc[df.index < cur_date]
             col = field if field in past.columns else 'close'
             past_series = past[col]
             # 前复权：对历史数据应用调整因子（当日 partial bar 已是最新价，factor=1.0）
             if dividend_type == 'front':
-                past_series = self.data_loader.adjusted(code, past_series)
-            partial = self._partial_day_bar(code, cur_date, cur_time, field)
+                past_series = self.data_loader.adjusted(data_code, past_series)
+            partial = self._partial_day_bar(data_code, cur_date, cur_time, field)
             if partial is None:
                 # 无 5min 数据，只返回历史
                 if len(past_series) < N:
@@ -459,33 +485,34 @@ class QMTShim:
                 if len(full) < N:
                     continue
                 arr = full[-N:]
-            result[code] = arr
+            result[code] = arr  # KEY BY ORIGINAL (QMT) code
         return result
 
     def get_market_data_ex(self, fields, codes, period='1d', start_time=None,
                            end_time=None, count=None, dividend_type='front', fill_data=True):
-        """兼容 v1 调用形态；返回 dict[code, pd.DataFrame]。"""
+        """兼容 v1 调用形态；返回 dict[code, pd.DataFrame]，键为 QMT 格式。"""
         result = {}
         cur_date = pd.Timestamp(self._bar_time.date())
         for code in codes:
-            if code not in self.data_loader.daily_df:
+            data_code = _to_data_code(code)
+            if data_code not in self.data_loader.daily_df:
                 continue
-            df = self.data_loader.daily_df[code]
+            df = self.data_loader.daily_df[data_code]
             past = df.loc[df.index < cur_date]
-            partial_close = self._partial_day_bar(code, cur_date, self._bar_time, 'close')
+            partial_close = self._partial_day_bar(data_code, cur_date, self._bar_time, 'close')
             if partial_close is not None:
                 row = pd.DataFrame({
-                    'open':   [self._partial_day_bar(code, cur_date, self._bar_time, 'open')],
-                    'high':   [self._partial_day_bar(code, cur_date, self._bar_time, 'high')],
-                    'low':    [self._partial_day_bar(code, cur_date, self._bar_time, 'low')],
+                    'open':   [self._partial_day_bar(data_code, cur_date, self._bar_time, 'open')],
+                    'high':   [self._partial_day_bar(data_code, cur_date, self._bar_time, 'high')],
+                    'low':    [self._partial_day_bar(data_code, cur_date, self._bar_time, 'low')],
                     'close':  [partial_close],
-                    'volume': [self._partial_day_bar(code, cur_date, self._bar_time, 'volume')],
+                    'volume': [self._partial_day_bar(data_code, cur_date, self._bar_time, 'volume')],
                 }, index=[cur_date])
                 full = pd.concat([past, row])
             else:
                 full = past
             sub = full.tail(count) if count else full
-            result[code] = sub[list(fields)] if fields else sub
+            result[code] = sub[list(fields)] if fields else sub  # KEY BY ORIGINAL (QMT) code
         return result
 
     def passorder(self, opType, orderType, account, code, prtype, price, volume, *args, **kwargs):
@@ -510,6 +537,7 @@ class QMTShim:
         """Return mock account/position info for v1 compatibility.
         query='ACCOUNT' returns list with one MockAccountInfo (m_dBalance, m_dAvailable).
         query='POSITION' returns list of MockPositionInfo (one per held position).
+        Account.positions is now keyed by QMT format; pass through as-is.
         """
         if query == 'ACCOUNT':
             obj = _MockAccountInfo(
@@ -520,14 +548,9 @@ class QMTShim:
         if query == 'POSITION':
             result = []
             for code, pos in self.account.positions.items():
-                # Convert 'SH.600000' to '600000.SH' (v1's expected format)
-                if code.startswith('SH.') or code.startswith('SZ.'):
-                    qmt_code = code.split('.', 1)[1] + '.' + code.split('.', 1)[0]
-                else:
-                    qmt_code = code
                 avail = self.account.available_volume(code)
                 result.append(_MockPositionInfo(
-                    m_strInstrumentID=qmt_code,
+                    m_strInstrumentID=code,  # already QMT format
                     m_nVolume=pos.volume,
                     m_nCanUseVolume=avail,
                     m_dOpenPrice=pos.open_price,
@@ -637,14 +660,16 @@ class EventLoop:
 
     def _fill_at(self, bar_ts: pd.Timestamp):
         def price(code):
-            m5 = self.data_loader.m5_df.get(code)
+            data_code = _to_data_code(code)
+            m5 = self.data_loader.m5_df.get(data_code)
             if m5 is None or bar_ts not in m5.index:
                 return None
             return float(m5.loc[bar_ts, 'close'])
         def name(code):
-            return self.shim._stock_names.get(code, code)
+            data_code = _to_data_code(code)
+            return self.shim._stock_names.get(data_code, code)
         def limit_up(code):
-            det = self.shim.get_instrumentdetail(code)
+            det = self.shim.get_instrumentdetail(code)  # already accepts QMT
             up = det.get('UpStopPrice')
             if up is None: return False
             cur = price(code)
@@ -659,9 +684,15 @@ class EventLoop:
 
     def _close_prices_at(self, day: pd.Timestamp):
         prices = {}
-        for code, df in self.data_loader.daily_df.items():
+        for data_code, df in self.data_loader.daily_df.items():
             if day in df.index:
-                prices[code] = float(df.loc[day, 'close'])
+                # Convert DataLoader format to QMT format for output dict keys
+                if data_code.startswith('SH.') or data_code.startswith('SZ.'):
+                    ex, num = data_code.split('.', 1)
+                    qmt_code = num + '.' + ex
+                else:
+                    qmt_code = data_code
+                prices[qmt_code] = float(df.loc[day, 'close'])
         return prices
 
 
@@ -834,6 +865,8 @@ def main(argv=None):
             'timetag_to_datetime': timetag_to_datetime,
         },
     )
+    # 回测时禁用历史回放跳过
+    v1.SKIP_HISTORY_WARMUP = False
 
     # 4. v1.init(shim)
     v1.init(shim)
