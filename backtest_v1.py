@@ -12,6 +12,7 @@ import glob
 from datetime import datetime
 import dataclasses
 from dataclasses import dataclass
+import types
 import numpy as np
 import pandas as pd
 
@@ -548,3 +549,32 @@ class _MockPositionInfo:
     m_nCanUseVolume: int
     m_dOpenPrice: float
     m_dMarketValue: float
+
+
+def load_v1_module(path: str, injected_globals: dict) -> types.ModuleType:
+    """Load hs300_trend_strategy_single_file_v1.py with injected QMT globals.
+
+    The v1 file may be gbk-encoded for QMT deployment, but locally it's utf-8.
+    This loader handles both by trying gbk first, falling back to utf-8.
+
+    Args:
+        path: Path to the v1 strategy file
+        injected_globals: dict of {name: callable} to inject (e.g., passorder, get_trade_detail_data, etc.)
+
+    Returns:
+        Loaded module with injected globals and v1's functions/classes
+    """
+    # Try gbk first (for QMT-deployed version), fall back to utf-8
+    try:
+        with open(path, 'r', encoding='gbk') as f:
+            source = f.read()
+    except (UnicodeDecodeError, LookupError):
+        with open(path, 'r', encoding='utf-8') as f:
+            source = f.read()
+
+    mod = types.ModuleType('hs300_v1_loaded')
+    mod.__file__ = path
+    mod.__dict__.update(injected_globals)
+    code = compile(source, path, 'exec')
+    exec(code, mod.__dict__)
+    return mod
