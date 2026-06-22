@@ -662,3 +662,66 @@ class EventLoop:
             if day in df.index:
                 prices[code] = float(df.loc[day, 'close'])
         return prices
+
+
+class Reporter:
+    def compute_metrics(self, snapshots, trades, periods):
+        out = []
+        for start, end in periods:
+            in_period = [s for s in snapshots if start <= s.date <= end]
+            if len(in_period) < 2:
+                continue
+            equity = np.array([s.total_equity for s in in_period], dtype=float)
+            ret = equity[-1] / equity[0] - 1
+            n_days = len(in_period)
+            ann = (1 + ret) ** (252 / max(n_days, 1)) - 1 if n_days > 0 else 0.0
+            # max drawdown
+            peak = np.maximum.accumulate(equity)
+            dd = (equity - peak) / peak
+            max_dd = float(dd.min())
+            # sharpe
+            daily_ret = np.diff(equity) / equity[:-1]
+            if daily_ret.std() > 0:
+                sharpe = float(daily_ret.mean() / daily_ret.std() * np.sqrt(252))
+            else:
+                sharpe = 0.0
+            # trade count + win rate（FIFO 配对）
+            period_trades = [t for t in trades if start <= t.bar_time.strftime('%Y-%m-%d') <= end]
+            buys_count = sum(1 for t in period_trades if t.side == 'BUY')
+            win_rate = self._fifo_win_rate(period_trades)
+
+            out.append({
+                'period': f'{start} ~ {end}',
+                'start_equity': float(equity[0]),
+                'end_equity': float(equity[-1]),
+                'return': float(ret),
+                'ann_return': float(ann),
+                'max_dd': max_dd,
+                'sharpe': sharpe,
+                'trades': buys_count,
+                'win_rate': win_rate,
+            })
+        return out
+
+    def _fifo_win_rate(self, trades):
+        from collections import defaultdict, deque
+        queues = defaultdict(deque)
+        wins = 0
+        total = 0
+        for t in trades:
+            if t.side == 'BUY':
+                queues[t.code].append((t.price, t.volume))
+            elif t.side == 'SELL':
+                remaining = t.volume
+                while remaining > 0 and queues[t.code]:
+                    buy_price, buy_vol = queues[t.code][0]
+                    matched = min(remaining, buy_vol)
+                    total += 1
+                    if t.price > buy_price:
+                        wins += 1
+                    remaining -= matched
+                    if matched == buy_vol:
+                        queues[t.code].popleft()
+                    else:
+                        queues[t.code][0] = (buy_price, buy_vol - matched)
+        return wins / total if total > 0 else 0.0
