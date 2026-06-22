@@ -598,7 +598,10 @@ class EventLoop:
         self._global_bar_idx = 0
 
     def run(self):
-        """Iterate trading days and 5min bars, calling handler per bar."""
+        """Iterate trading days and 5min bars, calling handler per bar.
+        After each bar: fill pending orders using next bar's close (or current bar if no next).
+        After last bar of day: take snapshot using EOD daily closes.
+        """
         start = pd.Timestamp(self.config.start_date)
         end = pd.Timestamp(self.config.end_date)
         source_df = self.data_loader.daily_df[self.trading_day_source]
@@ -609,11 +612,53 @@ class EventLoop:
             self.data_loader.ensure_month_loaded(ym)
             self.account.advance_day(day.strftime('%Y-%m-%d'))
 
-            m5 = self.data_loader.m5_df.get(self.trading_day_source)
-            if m5 is None:
+            m5_idx_df = self.data_loader.m5_df.get(self.trading_day_source)
+            if m5_idx_df is None:
                 continue
-            day_bars = m5[m5.index.normalize() == day]
-            for bar_ts in day_bars.index:
+            day_bars = m5_idx_df[m5_idx_df.index.normalize() == day]
+            bar_list = list(day_bars.index)
+            for i, bar_ts in enumerate(bar_list):
                 self.shim.advance_to(bar_ts.to_pydatetime(), self._global_bar_idx)
                 self.handler(self.shim)
+                # fill：用下一根 bar 的 close（若没有下一根=当日末尾→当日收盘价）
+                if self.account.pending_orders:
+                    next_idx = i + 1
+                    if next_idx < len(bar_list):
+                        fill_bar_ts = bar_list[next_idx]
+                    else:
+                        fill_bar_ts = bar_ts  # 当日最后一根：用当前 bar close
+                    self._fill_at(fill_bar_ts)
                 self._global_bar_idx += 1
+
+            # 收盘 snapshot
+            close_prices = self._close_prices_at(day)
+            self.account.snapshot(day.strftime('%Y-%m-%d'), close_prices)
+
+    def _fill_at(self, bar_ts: pd.Timestamp):
+        def price(code):
+            m5 = self.data_loader.m5_df.get(code)
+            if m5 is None or bar_ts not in m5.index:
+                return None
+            return float(m5.loc[bar_ts, 'close'])
+        def name(code):
+            return self.shim._stock_names.get(code, code)
+        def limit_up(code):
+            det = self.shim.get_instrumentdetail(code)
+            up = det.get('UpStopPrice')
+            if up is None: return False
+            cur = price(code)
+            return cur is not None and cur >= up * 0.995
+
+        self.account.fill_orders(
+            fill_price_provider=price,
+            stock_name_provider=name,
+            is_limit_up_provider=limit_up,
+            bar_time=bar_ts.to_pydatetime(),
+        )
+
+    def _close_prices_at(self, day: pd.Timestamp):
+        prices = {}
+        for code, df in self.data_loader.daily_df.items():
+            if day in df.index:
+                prices[code] = float(df.loc[day, 'close'])
+        return prices
