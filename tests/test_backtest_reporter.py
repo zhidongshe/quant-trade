@@ -1,5 +1,18 @@
 from backtest_v1 import Reporter, Snapshot, Trade
 from datetime import datetime
+import pandas as pd
+
+
+def test_write_all_creates_4_files(tmp_path):
+    r = Reporter()
+    snaps = [Snapshot('2024-01-02', 1000, 1000, 0, []), Snapshot('2024-01-03', 1100, 1100, 0, [])]
+    trades = [Trade(datetime(2024,1,3,15), 'SH.600000', '浦发', 'BUY', 10, 100, 1000, 1, 0, 0, 999, '买')]
+    hs300 = pd.Series([3000, 3030], index=pd.to_datetime(['2024-01-02', '2024-01-03']))
+    r.write_all(str(tmp_path), snaps, trades, hs300, periods=[('2024-01-01', '2024-01-31')])
+    assert (tmp_path / 'metrics.csv').exists()
+    assert (tmp_path / 'trades.csv').exists()
+    assert (tmp_path / 'daily_snapshot.csv').exists()
+    assert (tmp_path / 'equity_curve.png').exists()
 
 
 def test_compute_return_simple():

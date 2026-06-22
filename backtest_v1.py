@@ -725,3 +725,64 @@ class Reporter:
                     else:
                         queues[t.code][0] = (buy_price, buy_vol - matched)
         return wins / total if total > 0 else 0.0
+
+    def write_all(self, output_dir, snapshots, trades, hs300_close, periods):
+        os.makedirs(output_dir, exist_ok=True)
+        self.write_metrics(os.path.join(output_dir, 'metrics.csv'), snapshots, trades, periods)
+        self.write_trades(os.path.join(output_dir, 'trades.csv'), trades)
+        self.write_snapshots(os.path.join(output_dir, 'daily_snapshot.csv'), snapshots)
+        self.write_equity_png(os.path.join(output_dir, 'equity_curve.png'), snapshots, hs300_close)
+
+    def write_metrics(self, path, snapshots, trades, periods):
+        rows = self.compute_metrics(snapshots, trades, periods)
+        df = pd.DataFrame(rows)
+        df.to_csv(path, index=False, encoding='utf-8-sig')
+        # 同时打印到控制台
+        print(df.to_string(index=False))
+
+    def write_trades(self, path, trades):
+        rows = [
+            {
+                'bar_time': t.bar_time.strftime('%Y-%m-%d %H:%M:%S'),
+                'code': t.code, 'name': t.name, 'side': t.side,
+                'price': t.price, 'volume': t.volume, 'amount': t.amount,
+                'commission': t.commission, 'stamp_tax': t.stamp_tax,
+                'transfer_fee': t.transfer_fee, 'cash_after': t.cash_after,
+                'reason': t.reason,
+            }
+            for t in trades
+        ]
+        pd.DataFrame(rows).to_csv(path, index=False, encoding='utf-8-sig')
+
+    def write_snapshots(self, path, snapshots):
+        rows = []
+        for s in snapshots:
+            pos_str = ';'.join(f'{p.code}:{p.volume}@{p.open_price:.2f}' for p in s.positions)
+            rows.append({
+                'date': s.date, 'cash': s.cash, 'total_equity': s.total_equity,
+                'position_count': s.position_count, 'positions': pos_str,
+            })
+        pd.DataFrame(rows).to_csv(path, index=False, encoding='utf-8-sig')
+
+    def write_equity_png(self, path, snapshots, hs300_close):
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        dates = pd.to_datetime([s.date for s in snapshots])
+        equity = np.array([s.total_equity for s in snapshots])
+        eq_norm = equity / equity[0]
+        hs300_aligned = hs300_close.reindex(dates, method='ffill')
+        hs300_norm = hs300_aligned / hs300_aligned.iloc[0]
+        # 回撤
+        peak = np.maximum.accumulate(equity)
+        dd = (equity - peak) / peak
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True,
+                                       gridspec_kw={'height_ratios': [3, 1]})
+        ax1.plot(dates, eq_norm, label='Strategy', color='blue')
+        ax1.plot(dates, hs300_norm.values, label='HS300', color='gray', alpha=0.7)
+        ax1.legend(); ax1.grid(alpha=0.3); ax1.set_title('Equity Curve')
+        ax2.fill_between(dates, dd * 100, 0, color='red', alpha=0.4)
+        ax2.set_ylabel('Drawdown %'); ax2.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, dpi=100)
+        plt.close(fig)
