@@ -129,3 +129,49 @@ def test_get_history_data_raises_for_non_1d():
     shim.advance_to(datetime(2024, 1, 4, 14, 55), bar_idx_global=100)
     with pytest.raises(NotImplementedError):
         shim.get_history_data(5, '5m', 'close')
+
+
+# ---------------------------------------------------------------------------
+# Task 10: passorder + get_trade_detail_data
+# ---------------------------------------------------------------------------
+
+def test_passorder_buy_enqueues_to_account():
+    shim = _make_shim()
+    shim.advance_to(datetime(2024, 1, 2, 14, 55), 0)
+    shim.passorder(23, 1101, '8890358835', 'SH.600000', 5, 9.0, 1000,
+                   '价格类型', 1, '信号买入', 1)
+    assert len(shim.account.pending_orders) == 1
+    o = shim.account.pending_orders[0]
+    assert o.side == 'BUY' and o.code == 'SH.600000' and o.volume == 1000
+
+
+def test_passorder_sell_enqueues():
+    shim = _make_shim()
+    shim.advance_to(datetime(2024, 1, 5, 14, 55), 0)
+    shim.passorder(24, 1101, '8890358835', 'SH.600000', 5, 9.5, 500,
+                   '价格类型', 1, '止盈', 1)
+    o = shim.account.pending_orders[0]
+    assert o.side == 'SELL' and o.volume == 500
+
+
+def test_get_trade_detail_data_account_returns_balance():
+    shim = _make_shim()
+    res = shim.get_trade_detail_data('8890358835', 'STOCK', 'ACCOUNT')
+    assert len(res) == 1
+    assert hasattr(res[0], 'm_dBalance')
+    assert res[0].m_dBalance == 1_000_000
+
+
+def test_get_trade_detail_data_position_lists_holdings():
+    from backtest_v1 import Position
+    shim = _make_shim()
+    shim.account.positions['SH.600000'] = Position(
+        code='SH.600000', volume=1000, open_price=9.0, open_date='2024-01-02', market_value=9000.0
+    )
+    res = shim.get_trade_detail_data('8890358835', 'STOCK', 'POSITION')
+    assert len(res) == 1
+    p = res[0]
+    assert p.m_strInstrumentID == '600000.SH'  # 注意：v1 的 _normalize_stock_code 期望 '600000.SH'
+    assert p.m_nVolume == 1000
+    assert p.m_nCanUseVolume == 1000 - 0  # T+1 锁定情况由 caller 自己算
+    assert p.m_dOpenPrice == 9.0

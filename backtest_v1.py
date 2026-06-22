@@ -485,3 +485,66 @@ class QMTShim:
             sub = full.tail(count) if count else full
             result[code] = sub[list(fields)] if fields else sub
         return result
+
+    def passorder(self, opType, orderType, account, code, prtype, price, volume, *args, **kwargs):
+        """Convert v1's passorder call into a BacktestAccount.submit_order(Order).
+        opType 23 = BUY, 24 = SELL.
+        Reason is extracted from args[2] (the 备注 positional).
+        """
+        side = 'BUY' if opType == 23 else 'SELL' if opType == 24 else None
+        if side is None:
+            return
+        # v1 的 reason 在 args 里第 3 个参数 ('备注')
+        reason = ''
+        if len(args) >= 3 and isinstance(args[2], str):
+            reason = args[2]
+        order = Order(
+            bar_time=self._bar_time, code=code, side=side,
+            volume=int(volume), reason=reason,
+        )
+        self.account.submit_order(order)
+
+    def get_trade_detail_data(self, account, account_type, query):
+        """Return mock account/position info for v1 compatibility.
+        query='ACCOUNT' returns list with one MockAccountInfo (m_dBalance, m_dAvailable).
+        query='POSITION' returns list of MockPositionInfo (one per held position).
+        """
+        if query == 'ACCOUNT':
+            obj = _MockAccountInfo(
+                m_dBalance=self.account.cash + sum(p.market_value for p in self.account.positions.values()),
+                m_dAvailable=self.account.cash,
+            )
+            return [obj]
+        if query == 'POSITION':
+            result = []
+            for code, pos in self.account.positions.items():
+                # Convert 'SH.600000' to '600000.SH' (v1's expected format)
+                if code.startswith('SH.') or code.startswith('SZ.'):
+                    qmt_code = code.split('.', 1)[1] + '.' + code.split('.', 1)[0]
+                else:
+                    qmt_code = code
+                avail = self.account.available_volume(code)
+                result.append(_MockPositionInfo(
+                    m_strInstrumentID=qmt_code,
+                    m_nVolume=pos.volume,
+                    m_nCanUseVolume=avail,
+                    m_dOpenPrice=pos.open_price,
+                    m_dMarketValue=pos.market_value,
+                ))
+            return result
+        return []
+
+
+@dataclass
+class _MockAccountInfo:
+    m_dBalance: float
+    m_dAvailable: float
+
+
+@dataclass
+class _MockPositionInfo:
+    m_strInstrumentID: str
+    m_nVolume: int
+    m_nCanUseVolume: int
+    m_dOpenPrice: float
+    m_dMarketValue: float
