@@ -8,6 +8,7 @@
 from __future__ import annotations
 import argparse
 import os
+import sys
 import glob
 from datetime import datetime
 import dataclasses
@@ -786,3 +787,69 @@ class Reporter:
         fig.tight_layout()
         fig.savefig(path, dpi=100)
         plt.close(fig)
+
+
+def _yearly_periods(start: str, end: str) -> list[tuple[str, str]]:
+    """按自然年拆分 + 全期合计；首年若不足一年标 'YYYY(MM-MM)'"""
+    s = datetime.strptime(start, '%Y-%m-%d')
+    e = datetime.strptime(end, '%Y-%m-%d')
+    out = []
+    cur = s
+    while cur.year <= e.year:
+        y = cur.year
+        y_start = max(cur, datetime(y, 1, 1)).strftime('%Y-%m-%d')
+        y_end = min(datetime(y, 12, 31), e).strftime('%Y-%m-%d')
+        out.append((y_start, y_end))
+        cur = datetime(y + 1, 1, 1)
+    out.append((start, end))  # 全期合计
+    return out
+
+
+def main(argv=None):
+    cfg = BacktestConfig.from_cli(argv if argv is not None else sys.argv[1:])
+
+    # 1. 数据
+    loader = DataLoader(data_root=cfg.data_root)
+    loader.load_daily()
+
+    # 2. 账户 + shim
+    cost = CostConfig(
+        commission_rate=cfg.commission_rate,
+        commission_min=cfg.commission_min,
+        stamp_tax_rate=cfg.stamp_tax_rate,
+        transfer_fee_rate=cfg.transfer_fee_rate,
+        slippage_pct=cfg.slippage_pct,
+    )
+    account = BacktestAccount(initial_cash=cfg.initial_cash, cost_config=cost)
+    shim = QMTShim(loader, account)
+
+    # 3. 加载 v1，注入全局
+    v1 = load_v1_module(
+        'hs300_trend_strategy_single_file_v1.py',
+        injected_globals={
+            'passorder': shim.passorder,
+            'get_trade_detail_data': shim.get_trade_detail_data,
+            'get_sector': shim.get_sector,
+            'get_instrumentdetail': shim.get_instrumentdetail,
+            'timetag_to_datetime': timetag_to_datetime,
+        },
+    )
+
+    # 4. v1.init(shim)
+    v1.init(shim)
+
+    # 5. EventLoop
+    loop = EventLoop(loader, shim, account, cfg, v1.handlebar, trading_day_source='SH.000300')
+    loop.run()
+
+    # 6. 报告
+    ts_tag = datetime.now().strftime('%Y%m%d_%H%M%S')
+    out_dir = os.path.join(cfg.output_dir, f'{ts_tag}_{cfg.start_date}_{cfg.end_date}')
+    hs300_close = loader.daily_df['SH.000300']['close']
+    periods = _yearly_periods(cfg.start_date, cfg.end_date)
+    Reporter().write_all(out_dir, account.snapshots, account.trades, hs300_close, periods)
+    print(f'\n✓ 回测结果已落盘: {out_dir}')
+
+
+if __name__ == '__main__':
+    main()
