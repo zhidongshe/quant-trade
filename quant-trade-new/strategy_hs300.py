@@ -211,3 +211,18 @@ def check_market_trend(idx_prices):
     #    return False
 
     return bool(idx_prices[-1] > ma20 and hist[-1] > 0)
+
+
+# ════════════════════════════════════════════════════
+# §F 交易成本（纯函数 — 统一公式，替代 v1 中 4 处复制粘贴）
+# ════════════════════════════════════════════════════
+
+def trade_cost(side, amount):
+    """成本 = 佣金（最低 5）+ 印花税（仅卖）+ 过户费 + 滑点。"""
+    if side not in ('buy', 'sell'):
+        raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
+    commission = max(amount * COST['commission'], COST['commission_min'])
+    stamp = amount * COST['stamp'] if side == 'sell' else 0.0
+    transfer = amount * COST['transfer']
+    slippage = amount * COST['slippage']
+    return commission + stamp + transfer + slippage
