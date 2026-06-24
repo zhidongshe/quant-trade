@@ -77,8 +77,9 @@ def build_run_id(start: date, end: date, now: datetime) -> str:
     return f"{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}_{now.strftime('%Y%m%d-%H%M%S')}"
 
 
-def main():
-    ns = parse_args(None)
+def main(argv=None):
+    import sys
+    ns = parse_args(argv if argv is not None else sys.argv[1:])
     overrides = {
         'start_date': ns.start, 'end_date': ns.end,
         'initial_capital': ns.capital,

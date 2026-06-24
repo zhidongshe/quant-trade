@@ -3,7 +3,8 @@ from backtest.cli import load_config, parse_args, build_run_id
 
 
 def test_load_default_config():
-    cfg = load_config('configs/default.yaml', {})
+    cli_overrides = {'start_date': date(2020, 1, 1), 'end_date': date(2021, 12, 31)}
+    cfg = load_config('configs/default.yaml', cli_overrides)
     assert cfg.initial_capital == 500000.0
     assert cfg.commission_rate == 0.0001
     assert cfg.max_positions == 5
@@ -22,7 +23,7 @@ def test_cli_overrides_config():
 def test_missing_dates_raises():
     import pytest
     with pytest.raises(ValueError, match="start_date"):
-        load_config(None, {})  # 没有config文件，也没有CLI覆盖，应该抛出错误
+        load_config('configs/default.yaml', {})  # 默认 config 里 start/end 都是 null
 
 
 def test_parse_args_basic():

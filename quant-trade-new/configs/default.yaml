@@ -6,8 +6,8 @@ data_root: "../300data/data_a"
 results_dir: "results"
 
 # 时间段（必须 CLI 或此处提供）
-start_date: 2020-01-01
-end_date: 2021-12-31
+start_date: null
+end_date: null
 
 # 费率（v1 默认）
 commission_rate: 0.0001
