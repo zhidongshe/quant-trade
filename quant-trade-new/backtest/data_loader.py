@@ -80,9 +80,9 @@ class DataLoader:
             except Exception as e:
                 raise DataError(f"读取 {f.name} 失败: {e}")
             df = df.loc[load_start:load_end] if not df.empty else df
-            # 静态 universe：所有 ~301 只股票均记录，即使该区间无数据（如新股）
-            self.daily_df[code] = df
+            # 过滤掉在该区间无数据的股票（如 2021+ IPO 在 2020 切片为空）
             if not df.empty:
+                self.daily_df[code] = df
                 self._scan_quality(code, df)
 
         self._loaded = True

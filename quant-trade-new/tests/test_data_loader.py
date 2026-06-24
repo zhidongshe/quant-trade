@@ -43,7 +43,8 @@ def test_loaded_range_does_not_overshoot_end(loader):
 
 def test_universe_size_near_300(loader):
     codes = loader.universe_codes()
-    assert 295 <= len(codes) <= 305
+    # 静态全集约 300，其中部分 2021+ IPO 票在 2020 切片为空被过滤掉
+    assert 270 <= len(codes) <= 305
 
 
 def test_trading_calendar_in_range(loader):
