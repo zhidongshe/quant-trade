@@ -1,5 +1,7 @@
 """QMT API Shim：ContextInfo + 查询方法模拟。passorder/成交在 Task 9 实现。"""
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 import pandas as pd
 
 
@@ -236,3 +238,88 @@ class Shim:
         detail = self.context.get_instrumentdetail(code)
         down = detail.get('DownStopPrice', 0)
         return down > 0 and today_close <= down * 1.005
+
+    # ------------------------------------------------------------------
+    # Task 9: 成交接口 + 全局注入
+    # ------------------------------------------------------------------
+    def passorder(self, opcode, mode, account_id, code, price_mode,
+                  price, volume, ContextInfo):
+        """opcode: 23=买, 24=卖；其他 raise NotImplementedError。同步成交（方案 A）。"""
+        if opcode not in (23, 24):
+            raise NotImplementedError(f"passorder opcode {opcode} 未支持")
+
+        data_code = self._to_data_code(code)
+        df = self.data_loader.daily_df.get(data_code)
+        name = ''
+        if df is not None and not df.empty and 'name' in df.columns:
+            name = str(df['name'].iloc[0])
+
+        fill_price = self.get_today_close(code)
+        date_str = self.timetag_to_datetime(
+            self.context.get_bar_timetag(self.context.barpos), '%Y%m%d'
+        )
+        side = 'buy' if opcode == 23 else 'sell'
+
+        if fill_price is None:
+            self.account.record_reject(code, name, side, int(volume), 0.0, date_str, 'NO_PRICE')
+            return
+
+        if opcode == 23:
+            if self.is_limit_up(code):
+                self.account.record_reject(
+                    code, name, 'buy', int(volume), fill_price, date_str, 'LIMIT_UP'
+                )
+                return
+            self.account.fill_buy(code, name, int(volume), fill_price, date_str, reason='passorder')
+        else:
+            if self.is_limit_down(code):
+                self.account.record_reject(
+                    code, name, 'sell', int(volume), fill_price, date_str, 'LIMIT_DOWN'
+                )
+                return
+            self.account.fill_sell(code, name, int(volume), fill_price, date_str, reason='passorder')
+
+    def get_trade_detail_data(self, account_id, market='STOCK', kind='ACCOUNT'):
+        """模拟 QMT get_trade_detail_data，返回 SimpleNamespace 列表。"""
+        if kind == 'ACCOUNT':
+            total = self.account.cash + sum(
+                (self.get_today_close(c) or p.buy_price) * p.volume
+                for c, p in self.account.positions.items()
+            )
+            return [SimpleNamespace(m_dBalance=total, m_dAvailable=self.account.cash)]
+
+        if kind == 'POSITION':
+            return [
+                SimpleNamespace(
+                    m_strInstrumentID=c,
+                    m_nVolume=p.volume,
+                    m_nCanUseVolume=p.can_use_volume,
+                    m_dOpenPrice=p.buy_price,
+                )
+                for c, p in self.account.positions.items()
+            ]
+        return []
+
+    def timetag_to_datetime(self, timetag_ms: int, fmt: str) -> str:
+        """毫秒时间戳 → 格式化日期字符串。"""
+        return datetime.fromtimestamp(timetag_ms / 1000).strftime(fmt)
+
+    def get_market_data_ex(self, fields, codes, period='1d', start_time=None,
+                           end_time=None, count=None, dividend_type='front',
+                           fill_data=True):
+        """简单存根 — v1 不调用，预留兼容。"""
+        return {}
+
+    def injected_globals(self) -> dict:
+        """供 strategy_loader 注入给策略文件的全局字典。"""
+        import numpy as np
+        import os as os_mod
+        return {
+            'passorder': self.passorder,
+            'get_trade_detail_data': self.get_trade_detail_data,
+            'timetag_to_datetime': self.timetag_to_datetime,
+            'get_market_data_ex': self.get_market_data_ex,
+            'np': np,
+            'os': os_mod,
+            'datetime': datetime,
+        }
