@@ -151,7 +151,7 @@ class Position:
 
 def check_hard_stop(pos, current_price, hard_stop_pct=0.03):
     """硬止损。v1 行 159-162。注意：v1 默认参数 0.03，但 handlebar 传入 HARD_STOP_PCT=0.05。"""
-    return current_price <= pos.buy_price * (1 - hard_stop_pct)
+    return bool(current_price <= pos.buy_price * (1 - hard_stop_pct))
 
 
 def check_crash(prices):
@@ -177,7 +177,7 @@ def check_trailing_stop(pos, current_price, profit_threshold=0.05, pullback_pct=
     max_profit_pct = (pos.highest_price - pos.buy_price) / pos.buy_price
     if max_profit_pct <= profit_threshold:
         return False
-    return current_price <= pos.highest_price * (1 - pullback_pct)
+    return bool(current_price <= pos.highest_price * (1 - pullback_pct))
 
 
 def position_size(total_assets, available_cash, max_positions=5):
