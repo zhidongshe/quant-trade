@@ -132,3 +132,55 @@ def score_factors(prices, volumes):
         'macd_score': float(macd_score),
         'volume_score': float(volume_score),
     }
+
+
+# ════════════════════════════════════════════════════
+# §D 持仓与风控（纯函数）
+# ════════════════════════════════════════════════════
+
+class Position:
+    """简单持仓对象。v1 用法逐字保留。"""
+    def __init__(self, stockcode, buy_price, buy_date, volume, buy_trading_day_idx=0):
+        self.stockcode = stockcode
+        self.buy_price = buy_price
+        self.buy_date = buy_date
+        self.volume = volume
+        self.highest_price = buy_price
+        self.buy_trading_day_idx = buy_trading_day_idx
+
+
+def check_hard_stop(pos, current_price, hard_stop_pct=0.03):
+    """硬止损。v1 行 159-162。注意：v1 默认参数 0.03，但 handlebar 传入 HARD_STOP_PCT=0.05。"""
+    return current_price <= pos.buy_price * (1 - hard_stop_pct)
+
+
+def check_crash(prices):
+    """单日暴跌 -7% 保护。v1 handlebar 行 439-444 内嵌。"""
+    prices = np.asarray(prices, dtype=float)
+    if len(prices) < 2:
+        return False
+    daily_change = (prices[-1] - prices[-2]) / prices[-2] if prices[-2] > 0 else 0
+    return bool(daily_change <= -0.07)
+
+
+def check_trend_break(current_price, ma20, hist):
+    """跌破 MA20 + MACD 衰竭双确认。v1 handlebar 行 447-452 内嵌逻辑。"""
+    hist = np.asarray(hist, dtype=float)
+    macd_weakening = (hist[-1] <= 0) and (len(hist) >= 2) and (hist[-1] <= hist[-2])
+    return bool((current_price <= ma20) and macd_weakening)
+
+
+def check_trailing_stop(pos, current_price, profit_threshold=0.05, pullback_pct=0.05):
+    """跟踪止盈。v1 行 171-183。"""
+    if current_price > pos.highest_price:
+        pos.highest_price = current_price
+    max_profit_pct = (pos.highest_price - pos.buy_price) / pos.buy_price
+    if max_profit_pct <= profit_threshold:
+        return False
+    return current_price <= pos.highest_price * (1 - pullback_pct)
+
+
+def position_size(total_assets, available_cash, max_positions=5):
+    """每仓资金。v1 行 186-189。"""
+    target_per_stock = total_assets / max_positions
+    return min(target_per_stock, available_cash)
