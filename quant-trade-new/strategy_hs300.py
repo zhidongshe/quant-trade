@@ -184,3 +184,26 @@ def position_size(total_assets, available_cash, max_positions=5):
     """每仓资金。v1 行 186-189。"""
     target_per_stock = total_assets / max_positions
     return min(target_per_stock, available_cash)
+
+
+# ════════════════════════════════════════════════════
+# §E 大盘择时（纯函数）
+# ════════════════════════════════════════════════════
+
+def check_market_trend(idx_prices):
+    """大盘择时：close > MA20 且 MACD hist > 0 且当日跌幅 > -3%。
+    v1 行 247-267 逐字保留（注意 v1 注释掉了 MACD 缩窄检查）。"""
+    if idx_prices is None or len(idx_prices) < 20:
+        return False
+
+    idx_prices = np.asarray(idx_prices, dtype=float)
+
+    if len(idx_prices) >= 2:
+        daily_change = (idx_prices[-1] - idx_prices[-2]) / idx_prices[-2]
+        if daily_change <= -0.03:
+            return False
+
+    ma20 = np.mean(idx_prices[-20:])
+    _, _, hist = macd(idx_prices)
+
+    return bool(idx_prices[-1] > ma20 and hist[-1] > 0)
