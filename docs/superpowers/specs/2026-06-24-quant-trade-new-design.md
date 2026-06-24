@@ -115,12 +115,13 @@ quant-trade-new/
 §G QMT 接口适配  _normalize_code / _sync_positions / _filter_buyable /
                 _execute_buy / _execute_sell / _get_account
 §H 主控          init / handlebar
-                 handlebar 拆 9 个私有辅助函数:
+                 handlebar 拆 10 个私有辅助函数:
                    _is_actionable_bar
                    _daily_setup
                    _fetch_data
                    _update_market_streak
                    _evaluate_and_execute_sells
+                   _score_universe
                    _is_rebalance_day
                    _do_rebalance
                    _do_refill
@@ -135,7 +136,7 @@ quant-trade-new/
 | `get_history_data` 在 `handlebar` 内调用次数 | 3 次 | 1 次（封 `_fetch_data`） |
 | 交易成本公式 | 4 处复制粘贴 | 1 处 `trade_cost()` |
 | `_execute_sell` 的 log/del 顺序 bug | 现存 | 修：先记录 PnL，再 del positions |
-| `_log_status` 长度 | 150 行 | 仍是 public 函数（handlebar 调用），内部再拆 `_log_holdings / _log_sells_today / _log_summary` 三个私有 helper |
+| `_log_status` 长度 | 150 行 | 简化为 ~10 行的概要日志（总资产、持仓数、现金）；可选地内部再拆 helper，非强制 |
 | 测试可达性 | `handlebar` 几乎无法单测 | 9 个小函数全部可单测 |
 
 ### 5.2 保留不变（v1 业务规则原样）

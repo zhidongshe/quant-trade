@@ -3284,6 +3284,26 @@ def test_partial_year_label(tmp_path):
     assert any('2021' in l and '08-30' in l for l in labels)
 
 
+def test_avg_holding_days_computed_from_trades(tmp_path):
+    """从 buy/sell 配对的持有天数算均值（FIFO）。"""
+    cfg = make_config(date(2020, 1, 1), date(2020, 12, 31), tmp_path)
+    a = fake_account_with_snapshots([
+        ('20200102', 500000.0), ('20201231', 550000.0)
+    ])
+    a.trades = [
+        Trade(trade_id=1, date='20200110', code='SH.600000', name='浦发',
+              side='buy', volume=1000, price=10.0, amount=10000.0,
+              cost=5.0, reason='buy_signal', status='FILLED'),
+        Trade(trade_id=2, date='20200120', code='SH.600000', name='浦发',
+              side='sell', volume=1000, price=11.0, amount=11000.0,
+              cost=15.0, reason='trailing_stop', status='FILLED', realized_pnl=985.0),
+    ]
+    r = Reporter(a, cfg, run_dir=tmp_path)
+    period = r.compute_periods()[0]  # 2020 行
+    m = r.compute_metrics(period)
+    assert m['avg_holding_days'] == 10.0  # 2020-01-10 → 2020-01-20
+
+
 def test_write_all_creates_files(tmp_path):
     cfg = make_config(date(2020, 1, 1), date(2020, 12, 31), tmp_path)
     a = fake_account_with_snapshots([
@@ -3407,15 +3427,42 @@ class Reporter:
         win_rate = len(wins) / len(sell_trades) if sell_trades else 0
         total_cost = sum(t.cost for t in filled)
 
+        avg_hold = self._compute_avg_holding_days(filled)
+
         return {
             'period': period.label, 'start_date': period.start, 'end_date': period.end,
             'start_equity': round(start_eq, 2), 'end_equity': round(end_eq, 2),
             'total_return': round(total_ret, 6), 'annual_return': round(annual, 6),
             'max_drawdown': round(max_dd, 6), 'sharpe': round(sharpe, 4),
             'n_trades': len(filled), 'n_rejected': len(rejected),
-            'win_rate': round(win_rate, 4), 'avg_holding_days': 0,  # TODO 后续可补
+            'win_rate': round(win_rate, 4), 'avg_holding_days': round(avg_hold, 2),
             'total_cost': round(total_cost, 2),
         }
+
+    @staticmethod
+    def _compute_avg_holding_days(filled_trades):
+        """FIFO 配对 buy/sell，返回平均持有天数。"""
+        from datetime import datetime
+        open_lots = {}  # code -> [(buy_date_str, volume)]
+        holding_days = []
+        for t in filled_trades:
+            if t.side == 'buy':
+                open_lots.setdefault(t.code, []).append((t.date, t.volume))
+            elif t.side == 'sell':
+                remaining = t.volume
+                lots = open_lots.get(t.code, [])
+                while remaining > 0 and lots:
+                    buy_date, vol = lots[0]
+                    take = min(vol, remaining)
+                    d_buy = datetime.strptime(buy_date, '%Y%m%d')
+                    d_sell = datetime.strptime(t.date, '%Y%m%d')
+                    holding_days.append((d_sell - d_buy).days)
+                    remaining -= take
+                    if vol == take:
+                        lots.pop(0)
+                    else:
+                        lots[0] = (buy_date, vol - take)
+        return sum(holding_days) / len(holding_days) if holding_days else 0.0
 
     def write_all(self):
         self._write_metrics()
