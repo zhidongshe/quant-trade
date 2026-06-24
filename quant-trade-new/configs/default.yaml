@@ -1,0 +1,22 @@
+# v1 默认参数 + 用户指定初始资金 50w
+initial_capital: 500000.0
+
+# 数据
+data_root: "../300data/data_a"
+results_dir: "results"
+
+# 时间段（必须 CLI 或此处提供）
+start_date: 2020-01-01
+end_date: 2021-12-31
+
+# 费率（v1 默认）
+commission_rate: 0.0001
+commission_min: 5.0
+stamp_rate: 0.001
+transfer_rate: 0.00001
+slippage_rate: 0.0005
+
+# 策略参数（v1 默认）
+max_positions: 5
+rebalance_interval: 10
+warmup_days: 120
