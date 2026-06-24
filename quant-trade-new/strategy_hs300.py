@@ -206,4 +206,8 @@ def check_market_trend(idx_prices):
     ma20 = np.mean(idx_prices[-20:])
     _, _, hist = macd(idx_prices)
 
+    # 2. MACD红柱缩窄保护：拒绝多头衰竭信号
+    #if len(hist) >= 2 and hist[-1] <= hist[-2]:
+    #    return False
+
     return bool(idx_prices[-1] > ma20 and hist[-1] > 0)
