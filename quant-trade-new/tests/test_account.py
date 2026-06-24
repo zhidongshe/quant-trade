@@ -66,3 +66,12 @@ def test_fill_sell_releases_position():
     assert ok is True
     assert 'SH.600000' not in a.positions
     assert a.cash > 500000.0 - 1000 * 10.0  # 至少回收了大部分本金
+
+
+def test_first_snapshot_daily_return_is_zero():
+    """第一根 snapshot 的 daily_return 必须为 0（即使当日有交易导致 cash 变动）。"""
+    a = Account(initial_capital=500000.0)
+    a.fill_buy('SH.600000', '浦发', volume=1000, price=10.0,
+               date_str='20200101', reason='buy_signal')
+    snap = a.snapshot('20200101', close_prices={'SH.600000': 10.5})
+    assert snap.daily_return == 0.0

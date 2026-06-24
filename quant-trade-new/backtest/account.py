@@ -167,8 +167,11 @@ class Account:
             for c, p in self.positions.items()
         )
         total_equity = self.cash + position_value
-        prev_equity = self.snapshots[-1].total_equity if self.snapshots else self.initial_capital
-        daily_return = (total_equity - prev_equity) / prev_equity if prev_equity > 0 else 0.0
+        if self.snapshots:
+            prev_equity = self.snapshots[-1].total_equity
+            daily_return = (total_equity - prev_equity) / prev_equity if prev_equity > 0 else 0.0
+        else:
+            daily_return = 0.0  # 第一根 snapshot 总是 0
         snap = Snapshot(
             date=date_str,
             cash=self.cash,
