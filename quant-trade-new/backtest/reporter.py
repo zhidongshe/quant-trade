@@ -55,8 +55,14 @@ class Reporter:
         ))
         return periods
 
-    def compute_metrics(self, period: Period) -> dict:
-        """14 列指标字典。"""
+    def compute_metrics(self, period: Period,
+                        start_equity_override: float | None = None) -> dict:
+        """14 列指标字典。
+
+        start_equity_override: 当提供时，用于 total_return / annual_return 计算的起始
+        净值（用于跨年链式收益率计算，确保各年复合 = 总收益）。不影响 max_drawdown /
+        sharpe 的计算基础（这两者仍以 period 内第一个快照为锚）。
+        """
         in_period = [s for s in self.account.snapshots
                      if period.start <= s.date <= period.end]
 
@@ -79,7 +85,10 @@ class Reporter:
             }
 
         equities = [s.total_equity for s in in_period]
-        start_eq, end_eq = equities[0], equities[-1]
+        # start_equity_override 允许调用方传入上一期末净值，使各年 total_return
+        # 首尾相衔，保证 (1+y1)*(1+y2)-1 == total['total_return']
+        start_eq = start_equity_override if start_equity_override is not None else equities[0]
+        end_eq = equities[-1]
         total_ret = end_eq / start_eq - 1
         n_days = len(in_period)
         annual = (1 + total_ret) ** (252 / max(n_days, 1)) - 1
@@ -172,7 +181,19 @@ class Reporter:
         periods = self.compute_periods()
         if not periods:
             return
-        rows = [self.compute_metrics(p) for p in periods]
+
+        # 按年链式传递 prev_end_equity，确保 (1+y1)*(1+y2)-1 == total['total_return']。
+        # 'total' 行始终用全程第一个快照作为起点（不传 override）。
+        rows = []
+        prev_end_equity: float | None = None
+        for p in periods:
+            if p.label == 'total':
+                row = self.compute_metrics(p)
+            else:
+                row = self.compute_metrics(p, start_equity_override=prev_end_equity)
+                prev_end_equity = row['end_equity']
+            rows.append(row)
+
         path = self.run_dir / 'metrics.csv'
         with open(path, 'w', newline='', encoding='utf-8') as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))

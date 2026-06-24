@@ -1,5 +1,6 @@
 """CLI 入口与配置合并。"""
 import argparse
+import sys
 import yaml
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -78,7 +79,15 @@ def build_run_id(start: date, end: date, now: datetime) -> str:
 
 
 def main(argv=None):
-    import sys
+    from pathlib import Path
+    from backtest.data_loader import DataLoader
+    from backtest.account import Account
+    from backtest.shim import Shim
+    from backtest.strategy_loader import load_strategy
+    from backtest.engine import Engine
+    from backtest.reporter import Reporter
+    from dataclasses import replace
+
     ns = parse_args(argv if argv is not None else sys.argv[1:])
     overrides = {
         'start_date': ns.start, 'end_date': ns.end,
@@ -86,7 +95,39 @@ def main(argv=None):
         'data_root': ns.data_root, 'results_dir': ns.results_dir,
     }
     cfg = load_config(ns.config, overrides)
-    print(cfg)
+
+    run_id = build_run_id(cfg.start_date, cfg.end_date, datetime.now())
+    run_dir = Path(cfg.results_dir) / run_id
+    # 处理已存在
+    suffix = 0
+    while run_dir.exists() and any(run_dir.iterdir()):
+        suffix += 1
+        run_dir = Path(cfg.results_dir) / f"{run_id}_{suffix}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"run_dir: {run_dir}")
+
+    cfg = replace(cfg, results_dir=str(run_dir))
+
+    dl = DataLoader(cfg.data_root)
+    dl.load(cfg.start_date, cfg.end_date, cfg.warmup_days)
+
+    # 写 data_quality.log
+    qlog = run_dir / 'data_quality.log'
+    with open(qlog, 'w', encoding='utf-8') as f:
+        for line in dl.data_quality_log:
+            f.write(line + '\n')
+
+    acct = Account(cfg.initial_capital)
+    shim = Shim(dl, acct, run_dir=run_dir)
+    strategy_path = Path(__file__).parent.parent / 'strategy_hs300.py'
+    strat = load_strategy(strategy_path, shim.injected_globals())
+
+    engine = Engine(dl, acct, shim, strat, cfg)
+    engine.run()
+
+    reporter = Reporter(acct, cfg, run_dir=run_dir)
+    reporter.write_all()
+    print(f"done. results: {run_dir}")
 
 
 if __name__ == '__main__':
