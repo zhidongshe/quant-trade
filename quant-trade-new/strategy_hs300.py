@@ -442,3 +442,389 @@ def _execute_sell(ctx, code, reason, current_date):
                 current_date, code, sell_volume, reason_cn), ctx)
     except Exception as e:
         _log("[{0}] !! 卖出失败: {1} | {2}".format(current_date, code, e), ctx)
+
+
+# ════════════════════════════════════════════════════
+# §H 主控（init + handlebar + 10 个私有 helper）
+# ════════════════════════════════════════════════════
+
+def init(ContextInfo):
+    """v1 行 194-229，但删除 SKIP_HISTORY_WARMUP 相关日志逻辑。"""
+    ContextInfo.set_account(ACCOUNT_ID)
+    try:
+        acct_info = get_trade_detail_data(ACCOUNT_ID, ACCOUNT_TYPE, 'ACCOUNT')
+        if acct_info:
+            ContextInfo.capital = acct_info[0].m_dBalance
+        else:
+            ContextInfo.capital = 100000
+    except Exception:
+        ContextInfo.capital = 100000
+
+    ContextInfo.positions = {}
+    ContextInfo.last_trade_date = None
+    ContextInfo.accountid = ACCOUNT_ID
+    ContextInfo.rebalance_count = 0
+    ContextInfo.last_rebalance_date = None
+    ContextInfo.ranked_candidates = (None, [])
+    ContextInfo.realized_pnl = 0.0
+    ContextInfo.total_cost = 0.0
+    ContextInfo.trading_day_index = 0
+    ContextInfo.market_ok_streak = 1
+    ContextInfo.market_weak_streak = 0
+    ContextInfo.strategy_start_date = datetime.now().strftime('%Y%m%d')
+    ContextInfo.daily_cost = 0.0
+    ContextInfo.daily_sold_records = []
+
+    universe = ContextInfo.get_sector(INDEX_CODE)
+    if universe:
+        ContextInfo.set_universe(list(universe) + [INDEX_CODE])
+
+
+def _is_actionable_bar(ctx):
+    """时间闸 + 幂等 + start_date 过滤。"""
+    current_date = timetag_to_datetime(ctx.get_bar_timetag(ctx.barpos), '%Y%m%d')
+    current_time = timetag_to_datetime(ctx.get_bar_timetag(ctx.barpos), '%H:%M:%S')
+
+    # start_date 过滤（替代 SKIP_HISTORY_WARMUP，无条件执行）
+    if current_date < ctx.strategy_start_date:
+        return False
+
+    # 时间闸：分钟模式有效；日线模式 current_time='00:00:00' 自然通过
+    if current_time != '00:00:00' and current_time < '14:50:00':
+        return False
+
+    # barpos 幂等
+    last_bar = getattr(ctx, 'last_processed_barpos', -1)
+    if ctx.barpos <= last_bar:
+        return False
+    ctx.last_processed_barpos = ctx.barpos
+
+    # same-day 幂等
+    if ctx.last_trade_date == current_date:
+        return False
+    ctx.last_trade_date = current_date
+
+    return True
+
+
+def _daily_setup(ctx):
+    """每日起始：累计成本结算 + 计数器。"""
+    ctx.total_cost = getattr(ctx, 'total_cost', 0.0) + getattr(ctx, 'daily_cost', 0.0)
+    ctx.daily_sold_records = []
+    ctx.daily_cost = 0.0
+    ctx.trading_day_index = getattr(ctx, 'trading_day_index', 0) + 1
+    ctx.rebalance_count = getattr(ctx, 'rebalance_count', 0) + 1
+
+
+def _fetch_data(ctx):
+    """一次拿齐 close + volume + 指数。替代 v1 中 3 次 get_history_data。"""
+    hist_close = ctx.get_history_data(70, '1d', 'close', dividend_type='front', skip_paused=True)
+    hist_volume = ctx.get_history_data(70, '1d', 'volume', dividend_type='front', skip_paused=True)
+    idx_prices = None
+    if INDEX_CODE in hist_close and len(hist_close[INDEX_CODE]) >= 70:
+        idx_prices = np.array(hist_close[INDEX_CODE], dtype=float)
+    return hist_close, hist_volume, idx_prices
+
+
+def _update_market_streak(ctx, idx_prices):
+    """v1 行 390-401。"""
+    market_ok = check_market_trend(idx_prices)
+    if market_ok:
+        ctx.market_ok_streak = getattr(ctx, 'market_ok_streak', 0) + 1
+        ctx.market_weak_streak = 0
+    else:
+        ctx.market_ok_streak = 0
+        ctx.market_weak_streak = getattr(ctx, 'market_weak_streak', 0) + 1
+    return market_ok
+
+
+def _is_rebalance_day(ctx):
+    return ctx.rebalance_count >= REBALANCE_INTERVAL
+
+
+def _evaluate_and_execute_sells(ctx, hist_close, current_date):
+    """v1 行 403-505 字面保留。返回当日已卖出的 set。"""
+    positions_to_sell = []
+
+    for code, pos in list(ctx.positions.items()):
+        if code not in hist_close or len(hist_close[code]) < 1:
+            _log("[{0}] {1} 跳过卖出: 无数据".format(current_date, code), ctx)
+            continue
+        prices_list = hist_close[code]
+        current_price = float(prices_list[-1])
+
+        if current_price > pos.highest_price:
+            pos.highest_price = current_price
+
+        if len(prices_list) < 20:
+            if check_hard_stop(pos, current_price, HARD_STOP_PCT):
+                positions_to_sell.append((code, 'hard_stop'))
+            continue
+
+        prices_arr = np.array(prices_list, dtype=float)
+        ma20 = np.mean(prices_arr[-20:])
+        _, _, hist = macd(prices_arr)
+
+        should_sell = False
+        sell_reason = ''
+
+        if check_hard_stop(pos, current_price, HARD_STOP_PCT):
+            should_sell = True
+            sell_reason = 'hard_stop'
+        elif check_crash(prices_arr):
+            should_sell = True
+            sell_reason = 'crash_protection'
+
+        if not should_sell:
+            if check_trend_break(current_price, ma20, hist):
+                should_sell = True
+                sell_reason = 'trend_break'
+            elif check_trailing_stop(pos, current_price, PROFIT_THRESHOLD, TRAILING_PULLBACK):
+                should_sell = True
+                sell_reason = 'trailing_stop'
+
+        if should_sell:
+            pnl_pct = (current_price - pos.buy_price) / pos.buy_price * 100
+            _log("[{0}] 触发卖出: {1} | 原因: {2} | 买入价: {3:.2f} | 现价: {4:.2f} | 盈亏: {5:+.2f}%".format(
+                current_date, code, sell_reason, pos.buy_price, current_price, pnl_pct), ctx)
+            positions_to_sell.append((code, sell_reason))
+
+    # 大盘弱势清仓豁免（保留盈利 >10% 的强势股）
+    if ctx.market_weak_streak >= 2:
+        already = {s for s, _ in positions_to_sell}
+        for code, pos in list(ctx.positions.items()):
+            if code in already:
+                continue
+            max_profit = (pos.highest_price - pos.buy_price) / pos.buy_price
+            if max_profit <= PROFIT_THRESHOLD:
+                positions_to_sell.append((code, 'market_weak'))
+
+    # 执行卖出
+    sold_today = set()
+    for code, reason in positions_to_sell:
+        if code in ctx.positions:
+            pos = ctx.positions[code]
+            sell_price = pos.buy_price
+            if code in hist_close and len(hist_close[code]) > 0:
+                sell_price = float(hist_close[code][-1])
+                realized = (sell_price - pos.buy_price) * pos.volume
+                ctx.realized_pnl = getattr(ctx, 'realized_pnl', 0.0) + realized
+            ctx.daily_sold_records.append({
+                'stockcode': code, 'volume': pos.volume,
+                'buy_price': pos.buy_price, 'sell_price': sell_price,
+                'reason': reason, 'buy_date': pos.buy_date,
+            })
+            ctx.daily_cost = getattr(ctx, 'daily_cost', 0.0) + trade_cost('sell', pos.volume * sell_price)
+        _execute_sell(ctx, code, reason, current_date)
+        if code in ctx.positions:
+            del ctx.positions[code]
+        sold_today.add(code)
+
+    return sold_today
+
+
+def _score_universe(ctx, buy_universe, hist_close, hist_volume):
+    """打分 + Z-score 归一 + 加权。返回排序后的 list[(code, score)]."""
+    candidates = []
+    for code in buy_universe:
+        if code not in hist_close or len(hist_close[code]) < 70:
+            continue
+        if code not in hist_volume or len(hist_volume[code]) < 20:
+            continue
+        prices_arr = np.array(hist_close[code], dtype=float)
+        volumes_arr = np.array(hist_volume[code], dtype=float)
+        f = score_factors(prices_arr, volumes_arr)
+        if f is not None:
+            candidates.append((code, f))
+
+    scored = []
+    if candidates:
+        if len(candidates) >= 5:
+            for key in ('trend_score', 'ma_spread_score', 'macd_score', 'volume_score'):
+                values = np.array([f[key] for _, f in candidates], dtype=float)
+                mean = np.mean(values)
+                std = np.std(values)
+                if std > 1e-12:
+                    for _, f in candidates:
+                        f[key] = (f[key] - mean) / std
+                else:
+                    for _, f in candidates:
+                        f[key] = 0.0
+        for code, f in candidates:
+            total = (f['trend_score'] * WEIGHTS['trend']
+                     + f['ma_spread_score'] * WEIGHTS['spread']
+                     + f['macd_score'] * WEIGHTS['macd']
+                     + f['volume_score'] * WEIGHTS['volume'])
+            scored.append((code, total))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored
+
+
+def _do_rebalance(ctx, hist_close, hist_volume, sold_today, scored,
+                  total_assets, available_cash, current_date):
+    """换仓日。v1 行 581-716。"""
+    ctx.rebalance_count = 0
+    ctx.last_rebalance_date = current_date
+    top_n = scored[:MAX_POSITIONS]
+    top_codes = [x[0] for x in top_n]
+
+    _log("[{0}] ====== 换仓日 ====== Top{1}".format(current_date, MAX_POSITIONS), ctx)
+
+    # 卖出非 Top N 中且盈利 ≤10% 的（盈利 >10% 保留）
+    for code in list(ctx.positions.keys()):
+        if code in top_codes:
+            continue
+        pos = ctx.positions[code]
+        sell_price = pos.buy_price
+        if code in hist_close and len(hist_close[code]) > 0:
+            sell_price = float(hist_close[code][-1])
+            profit = (sell_price - pos.buy_price) / pos.buy_price
+            if profit > PROFIT_THRESHOLD:
+                _log("[{0}] 换仓保留: {1} | 盈利{2:+.2f}%".format(current_date, code, profit * 100), ctx)
+                continue
+            realized = (sell_price - pos.buy_price) * pos.volume
+            ctx.realized_pnl = getattr(ctx, 'realized_pnl', 0.0) + realized
+
+        ctx.daily_sold_records.append({
+            'stockcode': code, 'volume': pos.volume,
+            'buy_price': pos.buy_price, 'sell_price': sell_price,
+            'reason': 'rebalance', 'buy_date': pos.buy_date,
+        })
+        ctx.daily_cost = getattr(ctx, 'daily_cost', 0.0) + trade_cost('sell', pos.volume * sell_price)
+        _execute_sell(ctx, code, 'rebalance', current_date)
+        if code in ctx.positions:
+            del ctx.positions[code]
+        sold_today.add(code)
+
+    # 卖出后重新拿资金（v1 行 661-670）
+    total_assets, available_cash = _get_account(ctx)
+
+    # 买入 Top N（大盘连续 2 天 OK 才买）
+    if ctx.market_ok_streak >= 2:
+        current_holdings = len(ctx.positions)
+        for code, s in top_n:
+            if current_holdings >= MAX_POSITIONS:
+                break
+            if code in ctx.positions or code in sold_today:
+                continue
+            if code not in hist_close:
+                continue
+            prices_arr = np.array(hist_close[code], dtype=float)
+            current_price = float(prices_arr[-1])
+            buy_amount = position_size(total_assets, available_cash, MAX_POSITIONS)
+            if buy_amount < 1000:
+                continue
+            buy_volume = int(buy_amount / current_price / 100) * 100
+            if buy_volume < 100:
+                continue
+            success, cost = _execute_buy(ctx, code, buy_volume, current_price, current_date, score=s)
+            if success:
+                ctx.positions[code] = Position(
+                    stockcode=code, buy_price=current_price, buy_date=current_date,
+                    volume=buy_volume, buy_trading_day_idx=ctx.trading_day_index,
+                )
+                available_cash -= buy_volume * current_price + cost
+                current_holdings += 1
+                _, available_cash = _get_account(ctx)
+    else:
+        _log("[{0}] 大盘弱势，换仓日跳过买入".format(current_date), ctx)
+
+
+def _do_refill(ctx, hist_close, hist_volume, sold_today, scored,
+               total_assets, available_cash, current_date):
+    """非换仓日补仓。v1 行 718-772。"""
+    if ctx.market_ok_streak < 2:
+        return
+    current_holdings = len(ctx.positions)
+    if current_holdings >= MAX_POSITIONS:
+        return
+    for code, s in scored:
+        if current_holdings >= MAX_POSITIONS:
+            break
+        if code in ctx.positions or code in sold_today:
+            continue
+        if code not in hist_close or len(hist_close[code]) < 70:
+            continue
+        if code not in hist_volume or len(hist_volume[code]) < 20:
+            continue
+        prices_arr = np.array(hist_close[code], dtype=float)
+        volumes_arr = np.array(hist_volume[code], dtype=float)
+        if not check_buy_signal(prices_arr, volumes_arr):
+            continue
+        current_price = float(prices_arr[-1])
+        buy_amount = position_size(total_assets, available_cash, MAX_POSITIONS)
+        if buy_amount < 1000:
+            continue
+        buy_volume = int(buy_amount / current_price / 100) * 100
+        if buy_volume < 100:
+            continue
+        success, cost = _execute_buy(ctx, code, buy_volume, current_price, current_date, score=s)
+        if success:
+            ctx.positions[code] = Position(
+                stockcode=code, buy_price=current_price, buy_date=current_date,
+                volume=buy_volume, buy_trading_day_idx=ctx.trading_day_index,
+            )
+            available_cash -= buy_volume * current_price + cost
+            current_holdings += 1
+            _, available_cash = _get_account(ctx)
+
+
+def _log_status(ctx, current_date):
+    """v1 行 885-1034 简化版：~10 行概要日志（持仓数、总资产、现金）。"""
+    holdings = list(ctx.positions.keys())
+    sold = getattr(ctx, 'daily_sold_records', [])
+    if len(holdings) == 0 and len(sold) == 0:
+        total, _ = _get_account(ctx)
+        _log("[{0}] 当前持仓: 空仓 | 总资产: {1:.0f}元".format(current_date, total), ctx)
+        return
+    total, cash = _get_account(ctx)
+    _log("[{0}] 持仓 {1} 只 | 总资产: {2:.0f}元 | 现金: {3:.0f}元".format(
+        current_date, len(holdings), total, cash), ctx)
+
+
+def handlebar(ContextInfo):
+    """主调度。整个 handlebar 内只 ~30 行；细节都在 helper 里。"""
+    if not _is_actionable_bar(ContextInfo):
+        return
+
+    current_date = timetag_to_datetime(ContextInfo.get_bar_timetag(ContextInfo.barpos), '%Y%m%d')
+
+    _daily_setup(ContextInfo)
+    _sync_positions(ContextInfo, current_date)
+
+    universe = ContextInfo.get_sector(INDEX_CODE)
+    if not universe:
+        _log("[{0}] 无法获取沪深300成分股".format(current_date), ContextInfo)
+        return
+
+    # set_universe 仅当持仓股缺失时（v1 行 369-374）
+    held = list(ContextInfo.positions.keys())
+    missing = [c for c in held if c not in universe]
+    if missing:
+        ContextInfo.set_universe(list(set(universe + held + [INDEX_CODE])))
+
+    buy_universe = _filter_buyable(
+        [c for c in universe if c != INDEX_CODE],
+        ContextInfo
+    )
+
+    hist_close, hist_volume, idx_prices = _fetch_data(ContextInfo)
+    _update_market_streak(ContextInfo, idx_prices)
+    _log("[{0}] 持仓 {1} 只 | 大盘OK连{2}天 弱连{3}天 | 距换仓 {4} 日".format(
+        current_date, len(held), ContextInfo.market_ok_streak,
+        ContextInfo.market_weak_streak, REBALANCE_INTERVAL - ContextInfo.rebalance_count
+    ), ContextInfo)
+
+    sold_today = _evaluate_and_execute_sells(ContextInfo, hist_close, current_date)
+    total_assets, available_cash = _get_account(ContextInfo)
+    scored = _score_universe(ContextInfo, buy_universe, hist_close, hist_volume)
+    ContextInfo.ranked_candidates = (current_date, scored)
+
+    if _is_rebalance_day(ContextInfo):
+        _do_rebalance(ContextInfo, hist_close, hist_volume, sold_today, scored,
+                      total_assets, available_cash, current_date)
+    else:
+        _do_refill(ContextInfo, hist_close, hist_volume, sold_today, scored,
+                   total_assets, available_cash, current_date)
+
+    _log_status(ContextInfo, current_date)

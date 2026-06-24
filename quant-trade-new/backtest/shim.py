@@ -159,11 +159,19 @@ class Shim:
     # 时间推进
     # ------------------------------------------------------------------
     def advance_to(self, day: pd.Timestamp, barpos: int) -> None:
-        """推进当前交易日并更新 barpos 缓存。"""
+        """推进当前交易日并更新 barpos 缓存。
+
+        使用 Python stdlib datetime 创建本地午夜时间戳，保证与
+        timetag_to_datetime 里的 datetime.fromtimestamp() 时区一致。
+        pd.Timestamp.timestamp() 把 naive 当 UTC，而 fromtimestamp() 用本地时区，
+        两者在非 UTC 机器上会偏移；此处统一用 Python datetime（本地时区）。
+        """
+        from datetime import datetime as _dt
         self.context.barpos = barpos
         self.context._current_day = day
-        # 毫秒时间戳（QMT 惯例）
-        self.context._bar_ts_cache[barpos] = int(day.timestamp() * 1000)
+        # 本地午夜 → POSIX → fromtimestamp 解码回本地午夜
+        local_midnight = _dt(day.year, day.month, day.day, 0, 0, 0)
+        self.context._bar_ts_cache[barpos] = int(local_midnight.timestamp() * 1000)
 
     # ------------------------------------------------------------------
     # 代码形态转换
