@@ -94,9 +94,8 @@ class ContextInfo:
 
         - 只支持 period='1d'；其他 raise NotImplementedError。
         - 数据短于 N 天时返回短列表，不报错（QMT 行为）。
-        - 结果 key 使用与输入 universe 相同的形态：
-            * 若 _active_universe 非空，key 与 _active_universe 中保持一致；
-            * 指数 SH.000300 始终以数据形态 key 返回（策略用来取大盘数据）。
+        - 结果 key 全部使用策略形态（如 '600000.SH'、'000300.SH'）
+          与 set_universe 输入一致，确保 `if '000300.SH' in hist_prices` 能命中。
         """
         if period != '1d':
             raise NotImplementedError(
@@ -105,8 +104,8 @@ class ContextInfo:
         if self._current_day is None:
             return {}
 
-        # 收集需要返回的代码集合（key 形态由调用侧决定）
-        # 规则：active_universe 中的代码保留其形态；持仓同理；指数用 data-form key
+        # 收集需要返回的代码集合（key 形态全部用策略形态）
+        # 规则：active_universe 中的代码保留其形态；持仓同理；指数用策略形态 key
         code_map: dict[str, str] = {}  # result_key -> data_code
 
         # active_universe 中的代码（策略侧形态，如 '600000.SH'）
@@ -120,8 +119,8 @@ class ContextInfo:
                 data_c = self._shim._to_data_code(c)
                 code_map[c] = data_c
 
-        # 指数：始终以 data-form key 包含（策略用 'SH.000300' 来取大盘序列）
-        code_map['SH.000300'] = 'SH.000300'
+        # 指数：以策略形态 key 包含（策略用 '000300.SH' 来取大盘序列）
+        code_map['000300.SH'] = 'SH.000300'  # 策略形态 key → data 形态文件名
 
         result: dict[str, list] = {}
         for result_key, data_code in code_map.items():
