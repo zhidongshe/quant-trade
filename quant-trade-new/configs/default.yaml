@@ -1,8 +1,9 @@
 # v1 默认参数 + 用户指定初始资金 50w
-initial_capital: 500000.0
+initial_capital: 100000.0
 
 # 数据
-data_root: "../300data/data_a"
+data_source: "qmt"       # "qmt" (默认, qmt300下的.DAT) 或 "data_a" (300data/data_a下的CSV)
+data_root: "../qmt300"
 results_dir: "results"
 
 # 时间段（必须 CLI 或此处提供）

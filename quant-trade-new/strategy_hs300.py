@@ -382,6 +382,7 @@ def _execute_sell(ctx, code, reason, current_date):
     """v1 行 820-882。
     修 bug：v1 先下 passorder 再读 pos 信息（pos 可能已被上层 del），导致日志走 fallback。
     新版：**先**抓 pos 信息生成日志内容，**再**下 passorder，保证 buy_date/pnl 可见。
+    返回 True 表示卖出成交，False 表示拒单/失败；上层据此决定是否 del ctx.positions。
     """
     try:
         sell_volume = 0
@@ -466,8 +467,10 @@ def _execute_sell(ctx, code, reason, current_date):
         else:
             _log("[{0}] << 卖出: {1} | {2}股 | 原因: {3}".format(
                 current_date, code, sell_volume, reason_cn), ctx)
+        return True
     except Exception as e:
         _log("[{0}] !! 卖出失败: {1} | {2}".format(current_date, code, e), ctx)
+        return False
 
 
 # ════════════════════════════════════════════════════
@@ -646,8 +649,8 @@ def _evaluate_and_execute_sells(ctx, hist_close, current_date):
                 'reason': reason, 'buy_date': pos.buy_date,
             })
             ctx.daily_cost = getattr(ctx, 'daily_cost', 0.0) + trade_cost('sell', pos.volume * sell_price)
-        _execute_sell(ctx, code, reason, current_date)
-        if code in ctx.positions:
+        sell_ok = _execute_sell(ctx, code, reason, current_date)
+        if sell_ok and code in ctx.positions:
             del ctx.positions[code]
         sold_today.add(code)
 
@@ -722,8 +725,8 @@ def _do_rebalance(ctx, hist_close, hist_volume, sold_today, scored,
             'reason': 'rebalance', 'buy_date': pos.buy_date,
         })
         ctx.daily_cost = getattr(ctx, 'daily_cost', 0.0) + trade_cost('sell', pos.volume * sell_price)
-        _execute_sell(ctx, code, 'rebalance', current_date)
-        if code in ctx.positions:
+        sell_ok = _execute_sell(ctx, code, 'rebalance', current_date)
+        if sell_ok and code in ctx.positions:
             del ctx.positions[code]
         sold_today.add(code)
 

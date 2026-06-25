@@ -5,6 +5,15 @@ from types import SimpleNamespace
 import pandas as pd
 
 
+class OrderRejectedError(Exception):
+    """passorder 拒单时抛出的异常，strategy 层可 catch 来处理。"""
+    def __init__(self, code: str, side: str, reason: str):
+        self.code = code
+        self.side = side
+        self.reason = reason
+        super().__init__(f"{side} {code} 拒单: {reason}")
+
+
 class ContextInfo:
     """模拟 QMT 的 ContextInfo 对象。所有方法行为与 QMT 文档对齐。"""
 
@@ -253,7 +262,11 @@ class Shim:
     # ------------------------------------------------------------------
     def passorder(self, opcode, mode, account_id, code, price_mode,
                   price, volume, ContextInfo):
-        """opcode: 23=买, 24=卖；其他 raise NotImplementedError。同步成交（方案 A）。"""
+        """opcode: 23=买, 24=卖；其他 raise NotImplementedError。同步成交（方案 A）。
+
+        拒单时 raise OrderRejectedError（涨停买/跌停卖/现金不足/T+1 锁定等），
+        由策略层 catch 处理。
+        """
         if opcode not in (23, 24):
             raise NotImplementedError(f"passorder opcode {opcode} 未支持")
 
@@ -271,22 +284,26 @@ class Shim:
 
         if fill_price is None:
             self.account.record_reject(code, name, side, int(volume), 0.0, date_str, 'NO_PRICE')
-            return
+            raise OrderRejectedError(code, side, 'NO_PRICE')
 
         if opcode == 23:
             if self.is_limit_up(code):
                 self.account.record_reject(
                     code, name, 'buy', int(volume), fill_price, date_str, 'LIMIT_UP'
                 )
-                return
-            self.account.fill_buy(code, name, int(volume), fill_price, date_str, reason='passorder')
+                raise OrderRejectedError(code, 'buy', 'LIMIT_UP')
+            ok = self.account.fill_buy(code, name, int(volume), fill_price, date_str, reason='passorder')
+            if not ok:
+                raise OrderRejectedError(code, 'buy', 'CASH_SHORT')
         else:
             if self.is_limit_down(code):
                 self.account.record_reject(
                     code, name, 'sell', int(volume), fill_price, date_str, 'LIMIT_DOWN'
                 )
-                return
-            self.account.fill_sell(code, name, int(volume), fill_price, date_str, reason='passorder')
+                raise OrderRejectedError(code, 'sell', 'LIMIT_DOWN')
+            ok = self.account.fill_sell(code, name, int(volume), fill_price, date_str, reason='passorder')
+            if not ok:
+                raise OrderRejectedError(code, 'sell', 'T1_LOCKED')
 
     def get_trade_detail_data(self, account_id, market='STOCK', kind='ACCOUNT'):
         """模拟 QMT get_trade_detail_data，返回 SimpleNamespace 列表。"""

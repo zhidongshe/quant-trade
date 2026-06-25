@@ -11,6 +11,7 @@ class RunConfig:
     start_date: date
     end_date: date
     initial_capital: float
+    data_source: str
     data_root: str
     results_dir: str
     commission_rate: float
@@ -50,7 +51,8 @@ def load_config(config_path: str | None, cli_overrides: dict) -> RunConfig:
     return RunConfig(
         start_date=start, end_date=end,
         initial_capital=float(raw.get('initial_capital', 500000.0)),
-        data_root=str(raw.get('data_root', '../300data/data_a')),
+        data_source=str(raw.get('data_source', 'qmt')),
+        data_root=str(raw.get('data_root', '../qmt300')),
         results_dir=str(raw.get('results_dir', 'results')),
         commission_rate=float(raw.get('commission_rate', 0.0001)),
         commission_min=float(raw.get('commission_min', 5.0)),
@@ -70,6 +72,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument('--end', type=date.fromisoformat, dest='end')
     p.add_argument('--capital', type=float, dest='capital')
     p.add_argument('--data-root', dest='data_root')
+    p.add_argument('--data-source', dest='data_source', choices=['qmt', 'data_a'])
     p.add_argument('--results-dir', dest='results_dir')
     return p.parse_args(argv)
 
@@ -92,7 +95,8 @@ def main(argv=None):
     overrides = {
         'start_date': ns.start, 'end_date': ns.end,
         'initial_capital': ns.capital,
-        'data_root': ns.data_root, 'results_dir': ns.results_dir,
+        'data_source': ns.data_source, 'data_root': ns.data_root,
+        'results_dir': ns.results_dir,
     }
     cfg = load_config(ns.config, overrides)
 
@@ -108,7 +112,12 @@ def main(argv=None):
 
     cfg = replace(cfg, results_dir=str(run_dir))
 
-    dl = DataLoader(cfg.data_root)
+    # 根据 data_source 选择数据加载器
+    if cfg.data_source == 'qmt':
+        from backtest.qmt_reader import QMTDataLoader
+        dl = QMTDataLoader(cfg.data_root)
+    else:
+        dl = DataLoader(cfg.data_root)
     dl.load(cfg.start_date, cfg.end_date, cfg.warmup_days)
 
     # 写 data_quality.log
