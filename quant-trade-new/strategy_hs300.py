@@ -431,7 +431,7 @@ def _execute_sell(ctx, code, reason, current_date):
             buy_price = pos.buy_price
             hold_volume = pos.volume
             try:
-                hist = ctx.get_history_data(1, '1d', 'close', dividend_type=3)
+                hist = ctx.get_history_data(1, '1d', 'close', dividend_type=1)
                 if code in hist and len(hist[code]) > 0:
                     cur_for_pnl = float(hist[code][-1])
                     pnl_pct = (cur_for_pnl - pos.buy_price) / pos.buy_price * 100
@@ -549,8 +549,8 @@ def _daily_setup(ctx):
 
 def _fetch_data(ctx):
     """一次拿齐 close + volume + 指数。替代 v1 中 3 次 get_history_data。"""
-    hist_close = ctx.get_history_data(70, '1d', 'close', dividend_type=3, skip_paused=True)
-    hist_volume = ctx.get_history_data(70, '1d', 'volume', dividend_type=3, skip_paused=True)
+    hist_close = ctx.get_history_data(70, '1d', 'close', dividend_type=1, skip_paused=True)
+    hist_volume = ctx.get_history_data(70, '1d', 'volume', dividend_type=1, skip_paused=True)
     idx_prices = None
     if INDEX_CODE in hist_close and len(hist_close[INDEX_CODE]) >= 70:
         idx_prices = np.array(hist_close[INDEX_CODE], dtype=float)
