@@ -31,7 +31,7 @@ pytest tests/ -x
 6. 设置 K 线周期 = **5 分钟**
 7. 启动策略
 
-注意：策略文件无需手动改任何 flag（与 v1 区别于此）。
+注意：策略文件无需手动改任何 flag（与 v1 区别于此）。策略通过 `ContextInfo.do_back_test` 自动检测 QMT 回测模式（QMT 原生属性，回测时为 True，实盘时为 False）；本地 Shim 也设置 `do_back_test=True`，行为与 QMT 原生回测一致。
 
 ## 已知数据局限
 

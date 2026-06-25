@@ -20,6 +20,7 @@ class ContextInfo:
         self._active_universe: list = []
         self._bar_ts_cache: dict = {}
         self._current_day: pd.Timestamp | None = None
+        self.do_back_test: bool = True  # 本地 Shim 回测 == QMT 回测语义
 
     # ------------------------------------------------------------------
     # 配置方法

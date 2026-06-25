@@ -36,6 +36,7 @@ def test_handlebar_skips_before_start_date(env, tmp_path):
     strategy_hs300.init(env.context)
     env.context.log_dir = str(tmp_path)
     env.context.strategy_start_date = '20300101'  # 未来
+    env.context.do_back_test = False  # 实盘模式：start_date 过滤生效
     env.advance_to(pd.Timestamp('2020-03-02'), 0)
     strategy_hs300.handlebar(env.context)
     # 啥都不该做：仓位还是空
@@ -124,3 +125,35 @@ def test_handlebar_limit_up_reject_preserves_realized_pnl(env, tmp_path):
     _ = rejects  # 拒单数量不作强制断言（取决于大盘择时是否允许买入）
 
     env.is_limit_up = original_is_up  # cleanup
+
+
+def test_actionable_bar_skips_when_live_and_pre_start_date(env, tmp_path):
+    """实盘模式（do_back_test=False）+ 历史 bar → 过滤掉。"""
+    strategy_hs300.init(env.context)
+    env.context.log_dir = str(tmp_path)
+    env.context.strategy_start_date = '20300101'  # 假装明天才正式启动
+    env.context.do_back_test = False  # 实盘模式
+    env.advance_to(pd.Timestamp('2020-03-02'), 0)
+    assert strategy_hs300._is_actionable_bar(env.context) is False
+
+
+def test_actionable_bar_runs_when_qmt_backtest_even_pre_start_date(env, tmp_path):
+    """QMT 回测模式（do_back_test=True）+ 历史 bar → 过滤不应触发。"""
+    strategy_hs300.init(env.context)
+    env.context.log_dir = str(tmp_path)
+    env.context.strategy_start_date = '20300101'
+    env.context.do_back_test = True  # QMT 回测模式
+    env.advance_to(pd.Timestamp('2020-03-02'), 0)
+    assert strategy_hs300._is_actionable_bar(env.context) is True
+
+
+def test_actionable_bar_default_treats_as_live(env, tmp_path):
+    """do_back_test 属性缺失时默认按实盘处理（保守，与 v1 兼容）。"""
+    strategy_hs300.init(env.context)
+    env.context.log_dir = str(tmp_path)
+    env.context.strategy_start_date = '20300101'
+    # 不设 do_back_test
+    if hasattr(env.context, 'do_back_test'):
+        delattr(env.context, 'do_back_test')
+    env.advance_to(pd.Timestamp('2020-03-02'), 0)
+    assert strategy_hs300._is_actionable_bar(env.context) is False

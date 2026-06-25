@@ -512,9 +512,12 @@ def _is_actionable_bar(ctx):
     """时间闸 + 幂等 + start_date 过滤。"""
     current_date = timetag_to_datetime(ctx.get_bar_timetag(ctx.barpos), '%Y%m%d')
     current_time = timetag_to_datetime(ctx.get_bar_timetag(ctx.barpos), '%H:%M:%S')
+    _log("[bar] barpos={0} date={1} time={2}".format(ctx.barpos, current_date, current_time), ctx)
 
-    # start_date 过滤（替代 SKIP_HISTORY_WARMUP，无条件执行）
-    if current_date < ctx.strategy_start_date:
+    # QMT 回测模式 do_back_test=True 时不过滤历史 bar（QMT 回测就是要处理历史 bar）
+    # 实盘模式 do_back_test=False（默认），过滤启动时的历史回放
+    is_backtest = getattr(ctx, 'do_back_test', False)
+    if not is_backtest and current_date < ctx.strategy_start_date:
         return False
 
     # 时间闸：分钟模式有效；日线模式 current_time='00:00:00' 自然通过
