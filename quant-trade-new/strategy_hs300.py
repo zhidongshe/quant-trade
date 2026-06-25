@@ -370,7 +370,7 @@ def _execute_buy(ctx, code, volume, price, current_date, score=None):
         cost = trade_cost('buy', amount)
         ctx.daily_cost = getattr(ctx, 'daily_cost', 0.0) + cost
         score_str = " | 评分: {0:.4f}".format(score) if score is not None else ""
-        _log("[{0}] >> 买入: {1} | {2}股 x {3:.2f}元 = {4:.0f}元 | 成本: {5:.2f}元{6}".format(
+        _log("[{0}] >> 买入: {1} | {2}股 x {3:.2f}元 = {4:.0f}元 | 交易费用: {5:.2f}元{6}".format(
             current_date, code, volume, price, amount, cost, score_str), ctx)
         return True, cost
     except Exception as e:
@@ -431,7 +431,7 @@ def _execute_sell(ctx, code, reason, current_date):
             buy_price = pos.buy_price
             hold_volume = pos.volume
             try:
-                hist = ctx.get_history_data(1, '1d', 'close')
+                hist = ctx.get_history_data(1, '1d', 'close', dividend_type=3)
                 if code in hist and len(hist[code]) > 0:
                     cur_for_pnl = float(hist[code][-1])
                     pnl_pct = (cur_for_pnl - pos.buy_price) / pos.buy_price * 100
@@ -549,8 +549,8 @@ def _daily_setup(ctx):
 
 def _fetch_data(ctx):
     """一次拿齐 close + volume + 指数。替代 v1 中 3 次 get_history_data。"""
-    hist_close = ctx.get_history_data(70, '1d', 'close', dividend_type='front', skip_paused=True)
-    hist_volume = ctx.get_history_data(70, '1d', 'volume', dividend_type='front', skip_paused=True)
+    hist_close = ctx.get_history_data(70, '1d', 'close', dividend_type=3, skip_paused=True)
+    hist_volume = ctx.get_history_data(70, '1d', 'volume', dividend_type=3, skip_paused=True)
     idx_prices = None
     if INDEX_CODE in hist_close and len(hist_close[INDEX_CODE]) >= 70:
         idx_prices = np.array(hist_close[INDEX_CODE], dtype=float)
