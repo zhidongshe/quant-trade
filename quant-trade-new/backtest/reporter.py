@@ -62,6 +62,11 @@ class Reporter:
         start_equity_override: 当提供时，用于 total_return / annual_return 计算的起始
         净值（用于跨年链式收益率计算，确保各年复合 = 总收益）。不影响 max_drawdown /
         sharpe 的计算基础（这两者仍以 period 内第一个快照为锚）。
+
+        注意：当 start_equity_override 不为 None 时：
+        - `start_equity` 字段 = override 值（前年末权益），用于年度连贯的复合公式
+        - 但 `max_drawdown` 和 `sharpe` 仍以 period 内第一个 snapshot 为锚点
+          （回撤定义为"period 内"最大点对点回撤）
         """
         in_period = [s for s in self.account.snapshots
                      if period.start <= s.date <= period.end]
