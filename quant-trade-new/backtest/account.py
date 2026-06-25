@@ -1,5 +1,5 @@
 """回测账户：现金/持仓/订单/快照。T+1 严格模拟。"""
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import sys
 from pathlib import Path
 
@@ -50,11 +50,9 @@ class Account:
         self.trades: list[Trade] = []
         self.snapshots: list[Snapshot] = []
         self._trade_seq = 0
-        self._current_date: str = ''
 
     def advance_day(self, date_str: str):
-        """T+1 解锁：所有持仓 can_use_volume = volume；推进当前日。"""
-        self._current_date = date_str
+        """T+1 解锁：所有持仓 can_use_volume = volume。"""
         for pos in self.positions.values():
             pos.can_use_volume = pos.volume
 

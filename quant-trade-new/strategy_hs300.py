@@ -14,7 +14,9 @@ from datetime import datetime
 # §A 配置常量
 # ════════════════════════════════════════════════════
 
-ACCOUNT_ID = '8890358835'  # 实盘部署时改成你的账号
+# 实盘部署前必须改下面这行为你自己的资金账号；保留默认值会触发 init 警告
+DEFAULT_DEV_ACCOUNT_ID = '8890358835'
+ACCOUNT_ID = '8890358835'  # ← 改成你的实盘账号
 ACCOUNT_TYPE = 'STOCK'
 MAX_POSITIONS = 5
 HARD_STOP_PCT = 0.05
@@ -237,7 +239,7 @@ _LOG_FILE_PATH = None
 
 def _init_log(ctx=None):
     global _LOG_FILE_PATH
-    log_dir = getattr(ctx, 'log_dir', r'c:') if ctx else r'c:'
+    log_dir = getattr(ctx, 'log_dir', 'c:\\') if ctx else 'c:\\'
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     _LOG_FILE_PATH = os.path.join(log_dir, '量化日志_{0}.log'.format(ts))
 
@@ -421,18 +423,42 @@ def _execute_sell(ctx, code, reason, current_date):
         pos = ctx.positions.get(code)
         pnl_pct = 0.0
         buy_date = ''
+        buy_price = None
+        cur_for_pnl = None
+        hold_volume = 0
         if pos:
             buy_date = pos.buy_date
+            buy_price = pos.buy_price
+            hold_volume = pos.volume
             try:
                 hist = ctx.get_history_data(1, '1d', 'close')
                 if code in hist and len(hist[code]) > 0:
-                    cur = float(hist[code][-1])
-                    pnl_pct = (cur - pos.buy_price) / pos.buy_price * 100
+                    cur_for_pnl = float(hist[code][-1])
+                    pnl_pct = (cur_for_pnl - pos.buy_price) / pos.buy_price * 100
             except Exception:
                 pass
 
         # 下单（pos 信息已抓取，无论此后 pos 被谁 del 日志都不受影响）
         passorder(24, 1101, account_id, code, 5, -1.0, float(sell_volume), ctx)
+
+        # 确认成交后才累计 realized_pnl，防止拒单（LIMIT_DOWN / QMT 异常）产生幻象盈亏
+        if buy_price is not None and cur_for_pnl is not None and hold_volume > 0:
+            fill_confirmed = True
+            try:
+                pos_list = get_trade_detail_data(account_id, ACCOUNT_TYPE, 'POSITION')
+                if pos_list:
+                    still_holds = any(
+                        p.m_strInstrumentID == code and getattr(p, 'm_nVolume', 0) >= hold_volume
+                        for p in pos_list
+                    )
+                    if still_holds:
+                        fill_confirmed = False
+            except Exception:
+                # 查询失败时保守假设成交（保留 v1 在无法查询时的行为）
+                pass
+            if fill_confirmed:
+                realized = (cur_for_pnl - buy_price) * hold_volume
+                ctx.realized_pnl = getattr(ctx, 'realized_pnl', 0.0) + realized
 
         if buy_date:
             _log("[{0}] << 卖出: {1} | {2}股 | 原因: {3} | 持仓自: {4} | 盈亏: {5:+.2f}%".format(
@@ -451,6 +477,9 @@ def _execute_sell(ctx, code, reason, current_date):
 def init(ContextInfo):
     """v1 行 194-229，但删除 SKIP_HISTORY_WARMUP 相关日志逻辑。"""
     ContextInfo.set_account(ACCOUNT_ID)
+    if ACCOUNT_ID == DEFAULT_DEV_ACCOUNT_ID:
+        _log("⚠️ 警告: ACCOUNT_ID 仍是默认开发账号 '{0}'，实盘部署前请修改为你自己的账号！".format(
+            DEFAULT_DEV_ACCOUNT_ID), ContextInfo)
     try:
         acct_info = get_trade_detail_data(ACCOUNT_ID, ACCOUNT_TYPE, 'ACCOUNT')
         if acct_info:
@@ -465,7 +494,6 @@ def init(ContextInfo):
     ContextInfo.accountid = ACCOUNT_ID
     ContextInfo.rebalance_count = 0
     ContextInfo.last_rebalance_date = None
-    ContextInfo.ranked_candidates = (None, [])
     ContextInfo.realized_pnl = 0.0
     ContextInfo.total_cost = 0.0
     ContextInfo.trading_day_index = 0
@@ -607,8 +635,8 @@ def _evaluate_and_execute_sells(ctx, hist_close, current_date):
             sell_price = pos.buy_price
             if code in hist_close and len(hist_close[code]) > 0:
                 sell_price = float(hist_close[code][-1])
-                realized = (sell_price - pos.buy_price) * pos.volume
-                ctx.realized_pnl = getattr(ctx, 'realized_pnl', 0.0) + realized
+            # 注：daily_cost 和 daily_sold_records 仅用于策略侧日志展示；
+            # Account 是成本与已实现盈亏的权威源；realized_pnl 在 _execute_sell 确认成交后更新
             ctx.daily_sold_records.append({
                 'stockcode': code, 'volume': pos.volume,
                 'buy_price': pos.buy_price, 'sell_price': sell_price,
@@ -682,9 +710,9 @@ def _do_rebalance(ctx, hist_close, hist_volume, sold_today, scored,
             if profit > PROFIT_THRESHOLD:
                 _log("[{0}] 换仓保留: {1} | 盈利{2:+.2f}%".format(current_date, code, profit * 100), ctx)
                 continue
-            realized = (sell_price - pos.buy_price) * pos.volume
-            ctx.realized_pnl = getattr(ctx, 'realized_pnl', 0.0) + realized
 
+        # 注：daily_cost 和 daily_sold_records 仅用于策略侧日志展示；
+        # Account 是成本与已实现盈亏的权威源；realized_pnl 在 _execute_sell 确认成交后更新
         ctx.daily_sold_records.append({
             'stockcode': code, 'volume': pos.volume,
             'buy_price': pos.buy_price, 'sell_price': sell_price,
@@ -818,7 +846,6 @@ def handlebar(ContextInfo):
     sold_today = _evaluate_and_execute_sells(ContextInfo, hist_close, current_date)
     total_assets, available_cash = _get_account(ContextInfo)
     scored = _score_universe(ContextInfo, buy_universe, hist_close, hist_volume)
-    ContextInfo.ranked_candidates = (current_date, scored)
 
     if _is_rebalance_day(ContextInfo):
         _do_rebalance(ContextInfo, hist_close, hist_volume, sold_today, scored,

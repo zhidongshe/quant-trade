@@ -19,7 +19,7 @@ class Period:
 
 
 class Reporter:
-    def __init__(self, account, config, run_dir: Path):
+    def __init__(self, account: 'Account', config: 'RunConfig', run_dir: Path):
         self.account = account
         self.config = config
         self.run_dir = Path(run_dir)

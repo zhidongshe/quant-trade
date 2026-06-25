@@ -25,7 +25,7 @@ def test_passorder_buy_fills(shim):
     # opcode 23 = 买, mode 1101 = 按股数, price_mode 5 = 最新价
     shim.passorder(23, 1101, 'test_acct', '600000.SH', 5, -1.0, 1000.0, shim.context)
     # 检查 Account 状态
-    assert 'SH.600000' in shim.account.positions or '600000.SH' in shim.account.positions
+    assert '600000.SH' in shim.account.positions  # 策略形态 key
 
 
 def test_passorder_buy_cash_short_records_reject(shim):
