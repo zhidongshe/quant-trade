@@ -3,16 +3,24 @@
 格式（小端序 Little-Endian）：
 - 8 字节文件头（跳过）
 - N × 64 字节记录
-  每记录：
-    [0] int32  时间戳（Unix epoch 秒，CST 午夜 = 前一日 16:00 UTC）
-    [1] int32  开盘价 × 10000（个股）或 × 100（指数）
-    [2] int32  最高价 × 同上
-    [3] int32  最低价 × 同上
-    [4] int32  收盘价 × 同上
-    [5] int32  保留（通常为 0）
-    [6] int32  成交量（股）
-    [7] int32  标记（2 = 普通记录）
-    [8-15] float32 × 8  含复权因子等元数据
+  每记录（共 64 字节）：
+    偏移  0– 3  int32   时间戳（Unix epoch 秒，CST 午夜 = 前一日 16:00 UTC）
+    偏移  4– 7  int32   开盘价 × 1000
+    偏移  8–11  int32   最高价 × 1000
+    偏移 12–15  int32   最低价 × 1000
+    偏移 16–19  int32   收盘价 × 1000
+    偏移 20–23  int32   保留（通常为 0）
+    偏移 24–27  int32   成交笔数
+    偏移 28–31  int32   标记（2 = 普通记录）
+    偏移 32–39  uint64  成交量（股）
+    偏移 40–43  int32   标志位
+    偏移 44–47  float32 恒为 1.0（sentinel）
+    偏移 48–51  float32 未确定
+    偏移 52–55  int32   昨日收盘价 × 1000
+    偏移 56–59  int32   保留（通常为 0）
+    偏移 60–63  int32   终止标记（恒为 32766）
+
+个股与指数均使用 ×1000 的价格缩放。
 """
 
 import struct
@@ -23,10 +31,10 @@ import pandas as pd
 # CST = UTC+8
 CST = timezone(timedelta(hours=8))
 
-# 个股价格缩放因子
-STOCK_SCALE = 10000.0
-# 指数价格缩放因子（如 000300）
-INDEX_SCALE = 100.0
+# 个股与指数价格缩放因子均 ×1000
+# 验证：601899 2020-01-02 close=4750 → 4.75 CNY
+#        000300 2020-01-02 close=4152241 → 4152.241 ≈ 4152.24
+PRICE_SCALE = 1000.0
 
 
 def _ts_to_datetime(ts: int) -> pd.Timestamp:
@@ -58,13 +66,16 @@ def _read_dat_file(filepath: Path, price_scale: float) -> pd.DataFrame | None:
 
     for i in range(record_count):
         off = 8 + i * 64
+        # 偏移 0–31: 8 个 int32（时间戳 + OHLC + 保留 + 成交笔数 + 标记）
         vals = struct.unpack_from('<8i', data, off)
         ts = vals[0]
         o = vals[1] / price_scale
         h = vals[2] / price_scale
         l = vals[3] / price_scale
         c = vals[4] / price_scale
-        v = vals[6]  # volume
+        # 偏移 32–39: volume 为 uint64
+        v_lo, v_hi = struct.unpack_from('<2I', data, off + 32)
+        v = v_lo | (v_hi << 32)
 
         dates.append(_ts_to_datetime(ts))
         opens.append(o)
@@ -74,7 +85,6 @@ def _read_dat_file(filepath: Path, price_scale: float) -> pd.DataFrame | None:
         volumes.append(v)
 
     # name 从文件名推导
-    # 如 SH/600000.DAT → 四川路桥之类的名字暂用 code 代替
     code_name = filepath.stem  # e.g. "600000"
 
     df = pd.DataFrame({
@@ -83,7 +93,7 @@ def _read_dat_file(filepath: Path, price_scale: float) -> pd.DataFrame | None:
         'low': lows,
         'close': closes,
         'volume': volumes,
-        'name': code_name,  # 暂时用代码代替名称
+        'name': code_name,
     }, index=dates)
     df.index.name = 'time_key'
     return df
@@ -108,7 +118,7 @@ class QMTDataLoader:
 
         index_code 接受 '000300.SH'（策略形态），内部转为 'SH.000300'（数据形态）。
         """
-        data_key = 'SH.000300'  # QMT 数据中指数固定为 SH.000300
+        data_key = 'SH.000300'
         if data_key not in self.daily_df:
             raise FileNotFoundError(f"指数文件 {data_key} 缺失，请确认 {self.data_root}/SH/000300.DAT 存在")
         idx = self.daily_df[data_key].index
@@ -132,7 +142,7 @@ class QMTDataLoader:
         if not index_path.exists():
             raise FileNotFoundError(f"指数文件缺失: {index_path}")
 
-        idx_df = _read_dat_file(index_path, INDEX_SCALE)
+        idx_df = _read_dat_file(index_path, PRICE_SCALE)
         if idx_df is None or idx_df.empty:
             raise FileNotFoundError(f"指数文件为空: {index_path}")
 
@@ -172,7 +182,7 @@ class QMTDataLoader:
 
                 data_code = f'{exchange_prefix}.{code}'
                 try:
-                    df = _read_dat_file(f, STOCK_SCALE)
+                    df = _read_dat_file(f, PRICE_SCALE)
                 except Exception as e:
                     raise ValueError(f"读取 {f.name} 失败: {e}")
 
