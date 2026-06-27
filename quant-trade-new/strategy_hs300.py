@@ -6,6 +6,7 @@
 策略业务规则与 hs300_trend_strategy_single_file_v1.py 完全一致，仅整理结构。
 """
 
+import json
 import numpy as np
 import os
 import time
@@ -30,6 +31,12 @@ INDEX_CODE = '000300.SH'
 # 实盘下需要轮询等回报到位再算可用现金,否则同 bar 内卖→买会把现金严重低估。
 WAIT_FILL_TIMEOUT = 10  # 等待成交回报的最长秒数
 WAIT_FILL_POLL = 0.5    # 轮询 broker 的间隔秒数
+
+# 实盘状态持久化:策略重启后,QMT POSITION 能恢复持仓的 volume/cost,但 highest_price、
+# market_ok_streak、rebalance_count 等策略侧状态会丢失,导致跟踪止盈失效、换仓周期重置。
+# 这里把这些值写到 JSON 文件,init 时回读。
+# 回测(do_back_test=True)下不持久化,每次回测从零开始。
+STATE_FILE_DIR = 'c:\\'  # 实盘部署到 Windows QMT 机;非 Windows 上可改为本机可写目录测试
 
 WEIGHTS = {'trend': 0.30, 'spread': 0.25, 'macd': 0.25, 'volume': 0.20}
 
@@ -326,7 +333,8 @@ def _sync_positions(ctx, current_date):
                     'cost_price': p.m_dOpenPrice if hasattr(p, 'm_dOpenPrice') else 0.0,
                 }
 
-        # QMT 有但我们没记录的 → 补录
+        # QMT 有但我们没记录的 → 补录，再合并持久化状态中的 highest_price 等
+        persisted_positions = (getattr(ctx, 'persisted_state', {}) or {}).get('positions', {})
         for code, info in qmt_holdings.items():
             if code not in ctx.positions:
                 ctx.positions[code] = Position(
@@ -335,7 +343,12 @@ def _sync_positions(ctx, current_date):
                     buy_date=current_date,
                     volume=info['volume'],
                 )
-                _log("[{0}] 同步持仓: {1}, 数量{2}股".format(current_date, code, info['volume']), ctx)
+                # 实盘启动时,QMT POSITION 给的 buy_date=current_date 是错的(同步时刻而非真实买入日),
+                # highest_price 也丢了。从持久化文件恢复。
+                if code in persisted_positions:
+                    _apply_persisted_to_position(ctx.positions[code], persisted_positions[code])
+                _log("[{0}] 同步持仓: {1}, 数量{2}股, highest_price={3:.2f}".format(
+                    current_date, code, info['volume'], ctx.positions[code].highest_price), ctx)
 
         # 同步已有持仓 volume；清除 QMT 已不持有的
         for code in list(ctx.positions.keys()):
@@ -376,6 +389,140 @@ def _get_account(ctx, force_internal=False):
     # 持仓市值用最新可得价（无 hist 时退回买入价，结果略偏低但不影响 cash 估算）
     position_value = position_cost_basis
     return cash + position_value, cash
+
+
+def _state_file_path(ctx):
+    """返回 JSON 状态文件路径；回测下返回 None 表示不持久化。"""
+    if getattr(ctx, 'do_back_test', False):
+        return None
+    account_id = str(getattr(ctx, 'accountid', '') or 'unknown').strip()
+    safe = ''.join(ch if ch.isalnum() or ch in ('_', '-') else '_' for ch in account_id)
+    return os.path.join(STATE_FILE_DIR, 'hs300_live_{0}_state.json'.format(safe))
+
+
+def _load_state(ctx):
+    """init 时调用。返回 dict（空 dict 表示首次启动或文件不存在/损坏）。"""
+    path = _state_file_path(ctx)
+    if path is None or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        if not content:
+            return {}
+        data = json.loads(content)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        _log("状态文件读取失败 ({0}): {1}".format(path, e), ctx)
+        return {}
+
+
+def _save_state(ctx):
+    """handlebar 末尾调用。原子写(tmp + os.replace),Windows 文件锁时 3 次重试 + 直写兜底。
+
+    序列化:
+      - ctx 级:rebalance_count / last_rebalance_date / market_ok_streak / market_weak_streak /
+              trading_day_index / last_trade_date / last_processed_barpos / realized_pnl / total_cost
+      - 每 position:highest_price / buy_trading_day_idx / buy_date / buy_price
+        (buy_price 也存只是为了校验,真正权威源还是 QMT POSITION)
+    """
+    path = _state_file_path(ctx)
+    if path is None:
+        return  # 回测下不持久化
+    state = {
+        'schema_version': 1,
+        'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'rebalance_count': getattr(ctx, 'rebalance_count', 0),
+        'last_rebalance_date': getattr(ctx, 'last_rebalance_date', None),
+        'market_ok_streak': getattr(ctx, 'market_ok_streak', 1),
+        'market_weak_streak': getattr(ctx, 'market_weak_streak', 0),
+        'trading_day_index': getattr(ctx, 'trading_day_index', 0),
+        'last_trade_date': getattr(ctx, 'last_trade_date', None),
+        'last_processed_barpos': getattr(ctx, 'last_processed_barpos', -1),
+        'realized_pnl': getattr(ctx, 'realized_pnl', 0.0),
+        'total_cost': getattr(ctx, 'total_cost', 0.0),
+        'positions': {
+            code: {
+                'highest_price': pos.highest_price,
+                'buy_trading_day_idx': pos.buy_trading_day_idx,
+                'buy_date': pos.buy_date,
+                'buy_price': pos.buy_price,
+            }
+            for code, pos in ctx.positions.items()
+        },
+    }
+    try:
+        data_str = json.dumps(state, ensure_ascii=False)
+    except Exception as e:
+        _log("状态文件序列化失败: {0}".format(e), ctx)
+        return
+
+    tmp_path = path + '.tmp'
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            f.write(data_str)
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+    except Exception as e:
+        _log("状态文件 tmp 写入失败 ({0}): {1}".format(tmp_path, e), ctx)
+        return
+
+    for attempt in range(3):
+        try:
+            os.replace(tmp_path, path)
+            return
+        except OSError:
+            if attempt < 2:
+                time.sleep(0.05 * (attempt + 1))
+
+    # 三次 replace 失败,直接覆盖目标文件(非原子,但好过状态丢失)
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(data_str)
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+    except Exception as e:
+        _log("状态文件写入失败 ({0}): {1}".format(path, e), ctx)
+
+
+def _apply_persisted_to_ctx(ctx, persisted):
+    """init 末尾调用。把 persisted dict 中的 ctx 级字段写回 ctx，缺字段保留 ctx 默认。"""
+    if not isinstance(persisted, dict):
+        return
+    for key in ('rebalance_count', 'last_rebalance_date', 'market_ok_streak',
+                'market_weak_streak', 'trading_day_index', 'last_trade_date',
+                'last_processed_barpos', 'realized_pnl', 'total_cost'):
+        if key in persisted:
+            setattr(ctx, key, persisted[key])
+
+
+def _apply_persisted_to_position(pos, persisted_pos):
+    """_sync_positions 拿到 QMT POSITION 后调用，把 JSON 里的 highest_price 等合并回去。
+
+    QMT POSITION 给的是 volume / m_dOpenPrice 这种"事实"，但策略侧的派生状态(highest_price 等)
+    QMT 没有，必须从持久化文件里恢复。highest_price = max(persisted, buy_price) 防止持久化滞后。
+    """
+    if not isinstance(persisted_pos, dict):
+        return
+    if 'highest_price' in persisted_pos:
+        try:
+            pos.highest_price = max(float(persisted_pos['highest_price']), pos.buy_price)
+        except Exception:
+            pass
+    if 'buy_trading_day_idx' in persisted_pos:
+        try:
+            pos.buy_trading_day_idx = int(persisted_pos['buy_trading_day_idx'])
+        except Exception:
+            pass
+    if 'buy_date' in persisted_pos and persisted_pos['buy_date']:
+        # QMT POSITION 给的 buy_date 可能是同步时刻,持久化的是真实买入日,优先后者
+        pos.buy_date = str(persisted_pos['buy_date'])
 
 
 def _wait_for_sell_settlement(ctx, n_new_sells, current_date):
@@ -435,6 +582,8 @@ def _execute_buy(ctx, code, volume, price, current_date, score=None):
         score_str = " | 评分: {0:.4f}".format(score) if score is not None else ""
         _log("[{0}] >> 买入: {1} | {2}股 x {3:.2f}元 = {4:.0f}元 | 交易费用: {5:.2f}元{6}".format(
             current_date, code, volume, price, amount, cost, score_str), ctx)
+        # TODO(future): TradeStore.record(date, code, 'buy', volume, price, cost, score, reason='passorder')
+        # 接 SQLite/PG 后,这里发一条 trade event,前端可读历史/聚合/统计。
         return True, cost
     except Exception as e:
         _log("[{0}] !! 买入失败: {1} | {2}".format(current_date, code, e), ctx)
@@ -532,6 +681,9 @@ def _execute_sell(ctx, code, reason, current_date):
         else:
             _log("[{0}] << 卖出: {1} | {2}股 | 原因: {3}".format(
                 current_date, code, sell_volume, reason_cn), ctx)
+        # TODO(future): TradeStore.record(date, code, 'sell', sell_volume, cur_for_pnl, ...,
+        #                                  reason=reason, buy_date=buy_date, pnl_pct=pnl_pct)
+        # 接 SQLite/PG 后,这里发一条 trade event(含 realized_pnl),前端可读交易历史。
         return True
     except Exception as e:
         _log("[{0}] !! 卖出失败: {1} | {2}".format(current_date, code, e), ctx)
@@ -570,6 +722,12 @@ def init(ContextInfo):
     ContextInfo.strategy_start_date = datetime.now().strftime('%Y%m%d')
     ContextInfo.daily_cost = 0.0
     ContextInfo.daily_sold_records = []
+
+    # 实盘下从 JSON 恢复策略侧派生状态(highest_price / streak / counter)
+    # 回测下 _load_state 返回 {},不影响
+    persisted = _load_state(ContextInfo)
+    ContextInfo.persisted_state = persisted
+    _apply_persisted_to_ctx(ContextInfo, persisted)
 
     universe = ContextInfo.get_sector(INDEX_CODE)
     if universe:
@@ -936,3 +1094,7 @@ def handlebar(ContextInfo):
                    total_assets, available_cash, current_date)
 
     _log_status(ContextInfo, current_date)
+
+    # 写状态文件:实盘下保留 highest_price / streak / 计数器,重启可恢复
+    # 回测下 _save_state 内部检查 do_back_test 直接 return,无 IO
+    _save_state(ContextInfo)
