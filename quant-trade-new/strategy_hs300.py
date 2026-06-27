@@ -8,6 +8,7 @@
 
 import numpy as np
 import os
+import time
 from datetime import datetime
 
 # ════════════════════════════════════════════════════
@@ -24,6 +25,11 @@ PROFIT_THRESHOLD = 0.10
 TRAILING_PULLBACK = 0.08
 REBALANCE_INTERVAL = 10
 INDEX_CODE = '000300.SH'
+
+# 卖单走对手价(prType=11)能秒成交,但 broker 通过成交回报更新 m_dAvailable 是异步的,
+# 实盘下需要轮询等回报到位再算可用现金,否则同 bar 内卖→买会把现金严重低估。
+WAIT_FILL_TIMEOUT = 10  # 等待成交回报的最长秒数
+WAIT_FILL_POLL = 0.5    # 轮询 broker 的间隔秒数
 
 WEIGHTS = {'trend': 0.30, 'spread': 0.25, 'macd': 0.25, 'volume': 0.20}
 
@@ -343,22 +349,79 @@ def _sync_positions(ctx, current_date):
         _log("[{0}] 持仓同步异常: {1}".format(current_date, e), ctx)
 
 
-def _get_account(ctx):
+def _get_account(ctx, force_internal=False):
     """返回 (total_assets, available_cash)。
-    先尝试 get_trade_detail_data，失败时回退到 ctx.capital + realized_pnl。
-    v1 行 524-531 + 行 661-670 散落多处合并为单函数。
+
+    优先采用 QMT broker（m_dBalance / m_dAvailable）；接口不可用或 force_internal=True 时
+    回落到内部账本估算 capital + realized_pnl - position_cost_basis - total_cost。
+
+    force_internal=True 的使用场景：调用方知道 broker m_dAvailable 还没同步本 bar 的卖/买
+    （例如卖单回报未到或 QMT 回测下 broker 给的是 pre-bar 快照），此时强制走内部账本，
+    避免买入循环把现金严重低估。
     """
     account_id = getattr(ctx, 'accountid', '')
-    if account_id:
+    if not force_internal and account_id:
         try:
             acct_info = get_trade_detail_data(account_id, ACCOUNT_TYPE, 'ACCOUNT')
             if acct_info:
                 return acct_info[0].m_dBalance, acct_info[0].m_dAvailable
         except Exception:
             pass
-    # Fallback：用 capital + realized_pnl 估算
+
+    # 内部账本估算
     realized = getattr(ctx, 'realized_pnl', 0.0)
-    return ctx.capital + realized, ctx.capital + realized
+    total_cost_acc = getattr(ctx, 'total_cost', 0.0) + getattr(ctx, 'daily_cost', 0.0)
+    position_cost_basis = sum(p.buy_price * p.volume for p in ctx.positions.values())
+    cash = ctx.capital + realized - position_cost_basis - total_cost_acc
+    # 持仓市值用最新可得价（无 hist 时退回买入价，结果略偏低但不影响 cash 估算）
+    position_value = position_cost_basis
+    return cash + position_value, cash
+
+
+def _wait_for_sell_settlement(ctx, n_new_sells, current_date):
+    """卖单 passorder 后,轮询 broker m_dAvailable,等成交回报把现金提上来。
+
+    n_new_sells: 本 bar 内新发起的卖单数;为 0 直接返回 True。
+    回测模式（ctx.do_back_test=True，本地 Shim 同步成交 / QMT 回测）或 account_id 缺失
+    也直接返回 True —— 此时调用方无需轮询，broker 立刻准（Shim）或反正会走内部估算（QMT 回测）。
+
+    返回 True 表示 broker 已同步,调用方可信用 m_dAvailable；
+    False 表示超时,调用方应让 _get_account 走 force_internal=True 回落内部账本。
+    """
+    if n_new_sells <= 0:
+        return True
+    account_id = getattr(ctx, 'accountid', '')
+    if not account_id:
+        return True
+    is_backtest = getattr(ctx, 'do_back_test', False)
+    if is_backtest:
+        return True
+
+    # 内部账本算出的"卖出回款应到位后"的现金底线
+    realized = getattr(ctx, 'realized_pnl', 0.0)
+    total_cost_acc = getattr(ctx, 'total_cost', 0.0) + getattr(ctx, 'daily_cost', 0.0)
+    position_cost_basis = sum(p.buy_price * p.volume for p in ctx.positions.values())
+    expected_floor = ctx.capital + realized - position_cost_basis - total_cost_acc
+    target = expected_floor * 0.95  # 5% 余量避开手续费/滑点偏差
+
+    deadline = time.time() + WAIT_FILL_TIMEOUT
+    last_avail = None
+    while time.time() < deadline:
+        try:
+            acct_info = get_trade_detail_data(account_id, ACCOUNT_TYPE, 'ACCOUNT')
+            if acct_info:
+                last_avail = acct_info[0].m_dAvailable
+                if last_avail >= target:
+                    _log("[{0}] 卖单成交回报到位({1}笔): m_dAvailable={2:.0f}元 (期望底线{3:.0f})".format(
+                        current_date, n_new_sells, last_avail, target), ctx)
+                    return True
+        except Exception:
+            pass
+        time.sleep(WAIT_FILL_POLL)
+    _log("[{0}] 等成交回报超时{1}s({2}笔卖单): m_dAvailable={3} (期望底线{4:.0f}),回落内部账本估算".format(
+        current_date, WAIT_FILL_TIMEOUT, n_new_sells,
+        '?' if last_avail is None else "{0:.0f}".format(last_avail), target), ctx)
+    return False
 
 
 def _execute_buy(ctx, code, volume, price, current_date, score=None):
@@ -440,7 +503,9 @@ def _execute_sell(ctx, code, reason, current_date):
                 pass
 
         # 下单（pos 信息已抓取，无论此后 pos 被谁 del 日志都不受影响）
-        passorder(24, 1101, account_id, code, 5, -1.0, float(sell_volume), ctx)
+        # prType=11 对手价：卖单按当前买一价挂出，HS300 深度盘下几乎秒成交，
+        # 让 broker 的 m_dAvailable 尽快反映回款（避免同 bar 内卖→买的现金低估）。
+        passorder(24, 1101, account_id, code, 11, -1.0, float(sell_volume), ctx)
 
         # 确认成交后才累计 realized_pnl，防止拒单（LIMIT_DOWN / QMT 异常）产生幻象盈亏
         if buy_price is not None and cur_for_pnl is not None and hold_volume > 0:
@@ -577,7 +642,7 @@ def _is_rebalance_day(ctx):
 
 
 def _evaluate_and_execute_sells(ctx, hist_close, current_date):
-    """v1 行 403-505 字面保留。返回当日已卖出的 set。"""
+    """v1 行 403-505 字面保留。返回 (当日已卖出的 set, 实际成交的卖单笔数)。"""
     positions_to_sell = []
 
     for code, pos in list(ctx.positions.items()):
@@ -635,6 +700,7 @@ def _evaluate_and_execute_sells(ctx, hist_close, current_date):
 
     # 执行卖出
     sold_today = set()
+    n_new_sells = 0
     for code, reason in positions_to_sell:
         if code in ctx.positions:
             pos = ctx.positions[code]
@@ -650,11 +716,13 @@ def _evaluate_and_execute_sells(ctx, hist_close, current_date):
             })
             ctx.daily_cost = getattr(ctx, 'daily_cost', 0.0) + trade_cost('sell', pos.volume * sell_price)
         sell_ok = _execute_sell(ctx, code, reason, current_date)
-        if sell_ok and code in ctx.positions:
-            del ctx.positions[code]
+        if sell_ok:
+            n_new_sells += 1
+            if code in ctx.positions:
+                del ctx.positions[code]
         sold_today.add(code)
 
-    return sold_today
+    return sold_today, n_new_sells
 
 
 def _score_universe(ctx, buy_universe, hist_close, hist_volume):
@@ -705,6 +773,7 @@ def _do_rebalance(ctx, hist_close, hist_volume, sold_today, scored,
     _log("[{0}] ====== 换仓日 ====== Top{1}".format(current_date, MAX_POSITIONS), ctx)
 
     # 卖出非 Top N 中且盈利 ≤10% 的（盈利 >10% 保留）
+    n_rebalance_sells = 0
     for code in list(ctx.positions.keys()):
         if code in top_codes:
             continue
@@ -726,12 +795,15 @@ def _do_rebalance(ctx, hist_close, hist_volume, sold_today, scored,
         })
         ctx.daily_cost = getattr(ctx, 'daily_cost', 0.0) + trade_cost('sell', pos.volume * sell_price)
         sell_ok = _execute_sell(ctx, code, 'rebalance', current_date)
-        if sell_ok and code in ctx.positions:
-            del ctx.positions[code]
+        if sell_ok:
+            n_rebalance_sells += 1
+            if code in ctx.positions:
+                del ctx.positions[code]
         sold_today.add(code)
 
-    # 卖出后重新拿资金（v1 行 661-670）
-    total_assets, available_cash = _get_account(ctx)
+    # 卖出后重新拿资金；实盘下先等 broker 回报，超时回落内部账本
+    rebalance_sells_synced = _wait_for_sell_settlement(ctx, n_rebalance_sells, current_date)
+    total_assets, available_cash = _get_account(ctx, force_internal=not rebalance_sells_synced)
 
     # 买入 Top N（大盘连续 2 天 OK 才买）
     if ctx.market_ok_streak >= 2:
@@ -757,9 +829,10 @@ def _do_rebalance(ctx, hist_close, hist_volume, sold_today, scored,
                     stockcode=code, buy_price=current_price, buy_date=current_date,
                     volume=buy_volume, buy_trading_day_idx=ctx.trading_day_index,
                 )
+                # 手动扣减 available_cash，本 bar 不再读 broker —— broker 扣冻同样异步,
+                # 立刻读会拿到上一笔还没扣的快照,把第 2/3 笔买额高估。
                 available_cash -= buy_volume * current_price + cost
                 current_holdings += 1
-                _, available_cash = _get_account(ctx)
     else:
         _log("[{0}] 大盘弱势，换仓日跳过买入".format(current_date), ctx)
 
@@ -798,9 +871,9 @@ def _do_refill(ctx, hist_close, hist_volume, sold_today, scored,
                 stockcode=code, buy_price=current_price, buy_date=current_date,
                 volume=buy_volume, buy_trading_day_idx=ctx.trading_day_index,
             )
+            # 手动扣减,本 bar 不再读 broker（同 _do_rebalance）
             available_cash -= buy_volume * current_price + cost
             current_holdings += 1
-            _, available_cash = _get_account(ctx)
 
 
 def _log_status(ctx, current_date):
@@ -849,8 +922,10 @@ def handlebar(ContextInfo):
         ContextInfo.market_weak_streak, REBALANCE_INTERVAL - ContextInfo.rebalance_count
     ), ContextInfo)
 
-    sold_today = _evaluate_and_execute_sells(ContextInfo, hist_close, current_date)
-    total_assets, available_cash = _get_account(ContextInfo)
+    sold_today, n_risk_sells = _evaluate_and_execute_sells(ContextInfo, hist_close, current_date)
+    # 实盘下,卖单回报到位后再读 broker 现金；超时则强制内部账本估算
+    risk_sells_synced = _wait_for_sell_settlement(ContextInfo, n_risk_sells, current_date)
+    total_assets, available_cash = _get_account(ContextInfo, force_internal=not risk_sells_synced)
     scored = _score_universe(ContextInfo, buy_universe, hist_close, hist_volume)
 
     if _is_rebalance_day(ContextInfo):
