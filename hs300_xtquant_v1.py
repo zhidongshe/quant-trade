@@ -31,6 +31,7 @@ import numpy as np
 from datetime import datetime, timedelta
 
 from xtquant_live.config import load_live_config
+from xtquant_live.reconcile import classify_buy_outcome
 from xtquant_live.state_paths import build_log_file_path, build_state_file_path
 
 # 当前时间函数(实盘用datetime.now,回测由外部注入)
@@ -552,6 +553,24 @@ class Strategy:
         key = '{0}:{1}'.format(side, stockcode)
         self.state.setdefault('pending_orders', {}).pop(key, None)
 
+    def _confirm_buy_and_sync(self, stockcode, requested_volume, order_id, current_date):
+        before_positions = self.trader.get_positions() or {}
+        filled = self.trader.wait_order_filled(order_id, timeout=ORDER_CONFIRM_TIMEOUT)
+        after_positions = self.trader.get_positions() or {}
+        outcome = classify_buy_outcome(stockcode, requested_volume, before_positions, after_positions)
+        self._sync_positions()
+        if filled or outcome in ('filled', 'partial'):
+            self._clear_pending_order('buy', stockcode)
+            return True, outcome
+        self.state.setdefault('manual_review_flags', []).append({
+            'side': 'buy',
+            'stockcode': stockcode,
+            'order_id': str(order_id),
+            'trade_date': current_date,
+            'outcome': outcome,
+        })
+        return False, outcome
+
     def _check_market_trend(self, idx_prices):
         """判断大盘是否在上升趋势"""
         if idx_prices is None or len(idx_prices) < 20:
@@ -865,13 +884,16 @@ class Strategy:
                         continue
                     success, order_id = self.trader.buy(stockcode, buy_volume)
                     if success:
-                        self.positions[stockcode] = Position(
-                            stockcode, current_price, current_date, buy_volume,
-                            self.trading_day_index)
-                        available_cash -= buy_volume * current_price
-                        current_holdings += 1
-                        _log('[{0}] >> 买入成交: {1} | {2}股 @ {3:.2f}'.format(
-                            current_date, stockcode, buy_volume, current_price))
+                        self._record_pending_order('buy', stockcode, buy_volume, order_id, current_date)
+                        confirmed, outcome = self._confirm_buy_and_sync(stockcode, buy_volume, order_id, current_date)
+                        if confirmed and stockcode in self.positions:
+                            available_cash -= buy_volume * current_price
+                            current_holdings += 1
+                            _log('[{0}] >> 买入确认: {1} | {2}股 @ {3:.2f} | {4}'.format(
+                                current_date, stockcode, buy_volume, current_price, outcome))
+                        else:
+                            _log('[{0}] !! 买入待人工检查: {1} | order_id={2} | {3}'.format(
+                                current_date, stockcode, order_id, outcome))
         else:
             _log('[{0}] 大盘弱势,换仓日跳过买入'.format(current_date))
 
@@ -907,13 +929,16 @@ class Strategy:
                 continue
             success, order_id = self.trader.buy(stockcode, buy_volume)
             if success:
-                self.positions[stockcode] = Position(
-                    stockcode, current_price, current_date, buy_volume,
-                    self.trading_day_index)
-                available_cash -= buy_volume * current_price
-                current_holdings += 1
-                _log('[{0}] >> 补仓成交: {1} | {2}股 @ {3:.2f}'.format(
-                    current_date, stockcode, buy_volume, current_price))
+                self._record_pending_order('buy', stockcode, buy_volume, order_id, current_date)
+                confirmed, outcome = self._confirm_buy_and_sync(stockcode, buy_volume, order_id, current_date)
+                if confirmed and stockcode in self.positions:
+                    available_cash -= buy_volume * current_price
+                    current_holdings += 1
+                    _log('[{0}] >> 补仓确认: {1} | {2}股 @ {3:.2f} | {4}'.format(
+                        current_date, stockcode, buy_volume, current_price, outcome))
+                else:
+                    _log('[{0}] !! 补仓待人工检查: {1} | order_id={2} | {3}'.format(
+                        current_date, stockcode, order_id, outcome))
 
     def _persist(self, current_date, sold_today):
         """持久化状态"""
