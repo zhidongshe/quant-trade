@@ -32,7 +32,12 @@ from datetime import datetime, timedelta
 
 from xtquant_live.config import load_live_config
 from xtquant_live.guards import guard_can_continue_cycle, guard_can_open_new_positions
-from xtquant_live.reconcile import classify_buy_outcome, classify_sell_outcome
+from xtquant_live.reconcile import (
+    classify_buy_outcome,
+    classify_sell_outcome,
+    volume_delta_after_buy,
+    volume_delta_after_sell,
+)
 from xtquant_live.state_paths import build_log_file_path, build_state_file_path
 
 # 当前时间函数(实盘用datetime.now,回测由外部注入)
@@ -236,6 +241,28 @@ def calculate_buy_amount(total_assets, available_cash):
     target_per_stock = total_assets / MAX_POSITIONS
     return min(target_per_stock, available_cash)
 
+
+def normalize_stock_code(code):
+    if code is None:
+        return code
+    text = str(code).strip().upper()
+    if not text:
+        return text
+    if '.' in text:
+        return text
+    if text.startswith(('6', '9')):
+        return text + '.SH'
+    if text.startswith(('0', '3')):
+        return text + '.SZ'
+    return text
+
+
+def order_id_is_valid(order_id):
+    try:
+        return int(order_id) > 0
+    except (TypeError, ValueError):
+        return bool(order_id)
+
 # ==================== xtquant 交易层 (替代 passorder) ====================
 
 try:
@@ -311,7 +338,7 @@ class Trader:
             result = {}
             if positions:
                 for p in positions:
-                    code = p.stock_code
+                    code = normalize_stock_code(p.stock_code)
                     vol = int(p.volume)
                     if vol > 0:
                         result[code] = {
@@ -367,6 +394,9 @@ class Trader:
             )
             _log('[buy] {0} {1}股 price_type={2} order_id={3}'.format(
                 stockcode, volume, price_type, order_id))
+            if not order_id_is_valid(order_id):
+                _log('!! 买入被拒: {0} | order_id={1}'.format(stockcode, order_id))
+                return False, order_id
             return True, order_id
         except Exception as e:
             _log('!! 买入失败: {0} | {1}'.format(stockcode, e))
@@ -392,6 +422,9 @@ class Trader:
             )
             _log('[sell] {0} {1}股 price_type={2} order_id={3}'.format(
                 stockcode, volume, price_type, order_id))
+            if not order_id_is_valid(order_id):
+                _log('!! 卖出被拒: {0} | order_id={1}'.format(stockcode, order_id))
+                return False, order_id
             return True, order_id
         except Exception as e:
             _log('!! 卖出失败: {0} | {1}'.format(stockcode, e))
@@ -521,7 +554,19 @@ class Strategy:
         if broker_pos is None:
             return
 
-        meta_all = self.state.get('positions_meta', {})
+        normalized_broker = {}
+        for code, info in broker_pos.items():
+            normalized_broker[normalize_stock_code(code)] = info
+        broker_pos = normalized_broker
+        meta_all = {normalize_stock_code(code): meta for code, meta in self.state.get('positions_meta', {}).items()}
+
+        normalized_positions = {}
+        for code, pos in list(self.positions.items()):
+            normalized_code = normalize_stock_code(code)
+            if normalized_code != code:
+                pos.stockcode = normalized_code
+            normalized_positions[normalized_code] = pos
+        self.positions = normalized_positions
 
         # broker 有但我们没记录的 → 补录
         for code, info in broker_pos.items():
@@ -540,6 +585,8 @@ class Strategy:
                 self.positions[code] = pos
                 _log('同步持仓: {0} {1}股 | buy_date={2} highest={3:.2f}'.format(
                     code, info['volume'], pos.buy_date, pos.highest_price))
+            else:
+                self.positions[code].volume = info['volume']
 
         # broker 没有但我们记录的 → 清除
         for code in list(self.positions.keys()):
@@ -548,6 +595,7 @@ class Strategy:
                 del self.positions[code]
 
     def _record_pending_order(self, side, stockcode, volume, order_id, current_date):
+        stockcode = normalize_stock_code(stockcode)
         key = '{0}:{1}'.format(side, stockcode)
         self.state.setdefault('pending_orders', {})[key] = {
             'side': side,
@@ -558,18 +606,23 @@ class Strategy:
         }
 
     def _clear_pending_order(self, side, stockcode):
+        stockcode = normalize_stock_code(stockcode)
         key = '{0}:{1}'.format(side, stockcode)
         self.state.setdefault('pending_orders', {}).pop(key, None)
 
     def _confirm_buy_and_sync(self, stockcode, requested_volume, order_id, current_date):
+        stockcode = normalize_stock_code(stockcode)
         before_positions = self.trader.get_positions() or {}
+        before_positions = {normalize_stock_code(code): info for code, info in before_positions.items()}
         filled = self.trader.wait_order_filled(order_id, timeout=ORDER_CONFIRM_TIMEOUT)
         after_positions = self.trader.get_positions() or {}
+        after_positions = {normalize_stock_code(code): info for code, info in after_positions.items()}
         outcome = classify_buy_outcome(stockcode, requested_volume, before_positions, after_positions)
+        filled_volume = volume_delta_after_buy(stockcode, before_positions, after_positions)
         self._sync_positions()
         if filled or outcome in ('filled', 'partial'):
             self._clear_pending_order('buy', stockcode)
-            return True, outcome
+            return True, outcome, filled_volume
         self.state.setdefault('manual_review_flags', []).append({
             'side': 'buy',
             'stockcode': stockcode,
@@ -577,17 +630,21 @@ class Strategy:
             'trade_date': current_date,
             'outcome': outcome,
         })
-        return False, outcome
+        return False, outcome, filled_volume
 
     def _confirm_sell_and_sync(self, stockcode, requested_volume, order_id, current_date):
+        stockcode = normalize_stock_code(stockcode)
         before_positions = self.trader.get_positions() or {}
+        before_positions = {normalize_stock_code(code): info for code, info in before_positions.items()}
         filled = self.trader.wait_order_filled(order_id, timeout=ORDER_CONFIRM_TIMEOUT)
         after_positions = self.trader.get_positions() or {}
+        after_positions = {normalize_stock_code(code): info for code, info in after_positions.items()}
         outcome = classify_sell_outcome(stockcode, requested_volume, before_positions, after_positions)
+        sold_volume = volume_delta_after_sell(stockcode, before_positions, after_positions)
         self._sync_positions()
         if filled or outcome in ('filled', 'partial'):
             self._clear_pending_order('sell', stockcode)
-            return True, outcome
+            return True, outcome, sold_volume
         self.state.setdefault('manual_review_flags', []).append({
             'side': 'sell',
             'stockcode': stockcode,
@@ -595,7 +652,7 @@ class Strategy:
             'trade_date': current_date,
             'outcome': outcome,
         })
-        return False, outcome
+        return False, outcome, sold_volume
 
     def _can_continue_cycle(self):
         allowed, reason = guard_can_continue_cycle(self.trader.get_asset(), self.trader.get_positions())
@@ -612,7 +669,23 @@ class Strategy:
         stale_bucket = self.state.setdefault('stale_pending_orders', [])
         stale_keys = [key for key, value in pending.items() if value.get('trade_date') != current_date]
         for key in stale_keys:
-            stale_bucket.append(pending.pop(key))
+            order = pending.pop(key)
+            order['stale_detected_date'] = current_date
+            stale_bucket.append(order)
+
+    def _pending_buy_codes(self):
+        return {
+            normalize_stock_code(value.get('stockcode'))
+            for value in self.state.setdefault('pending_orders', {}).values()
+            if value.get('side') == 'buy'
+        }
+
+    def _occupied_slots(self):
+        return len(set(self.positions.keys()) | self._pending_buy_codes())
+
+    def _is_position_or_pending(self, stockcode):
+        stockcode = normalize_stock_code(stockcode)
+        return stockcode in self.positions or stockcode in self._pending_buy_codes()
 
     def _check_market_trend(self, idx_prices):
         """判断大盘是否在上升趋势"""
@@ -690,11 +763,11 @@ class Strategy:
             return
 
         # 过滤: 只排除创业板(300/301)和科创板(688) + ST
-        buy_universe = [c for c in self._filter_st_stocks(universe)
-                        if c != '000300.SH'
-                        and not c.startswith('688')
-                        and not c.startswith('300')
-                        and not c.startswith('301')]
+        buy_universe = [normalize_stock_code(c) for c in self._filter_st_stocks(universe)
+                        if normalize_stock_code(c) != '000300.SH'
+                        and not normalize_stock_code(c).startswith('688')
+                        and not normalize_stock_code(c).startswith('300')
+                        and not normalize_stock_code(c).startswith('301')]
 
         # 2. 获取历史数据(一次性获取 close + volume)
         all_codes = list(set(buy_universe + holdings + ['000300.SH']))
@@ -805,7 +878,7 @@ class Strategy:
                 continue
 
             self._record_pending_order('sell', stockcode, pos.volume, order_id, current_date)
-            confirmed, outcome = self._confirm_sell_and_sync(stockcode, pos.volume, order_id, current_date)
+            confirmed, outcome, sold_volume = self._confirm_sell_and_sync(stockcode, pos.volume, order_id, current_date)
             if confirmed and stockcode not in self.positions:
                 sell_price = float(hist_prices[stockcode][-1]) if stockcode in hist_prices else pos.buy_price
                 realized = (sell_price - pos.buy_price) * pos.volume
@@ -880,7 +953,7 @@ class Strategy:
     def _do_rebalance(self, scored, hist_prices, sold_today, market_ok, current_date):
         """换仓日逻辑"""
         top_n = scored[:MAX_POSITIONS]
-        top_codes = [x[0] for x in top_n]
+        top_codes = [normalize_stock_code(x[0]) for x in top_n]
 
         _log('[{0}] ====== 换仓日 ======'.format(current_date))
         _log('[{0}] 候选: {1}只 | Top{2}: {3}'.format(
@@ -910,7 +983,7 @@ class Strategy:
                 _log('[{0}] !! 换仓卖出被拒: {1}'.format(current_date, stockcode))
                 continue
             self._record_pending_order('sell', stockcode, pos.volume, order_id, current_date)
-            confirmed, outcome = self._confirm_sell_and_sync(stockcode, pos.volume, order_id, current_date)
+            confirmed, outcome, sold_volume = self._confirm_sell_and_sync(stockcode, pos.volume, order_id, current_date)
             if confirmed and stockcode not in self.positions:
                 _log('[{0}] 换仓卖出确认: {1} | {2}'.format(current_date, stockcode, outcome))
                 sold_today.add(stockcode)
@@ -924,11 +997,12 @@ class Strategy:
             asset = self.trader.get_asset()
             if asset:
                 total_assets, available_cash = asset[0], asset[1]
-                current_holdings = len(self.positions)
+                current_holdings = self._occupied_slots()
                 for stockcode, s in top_n:
+                    stockcode = normalize_stock_code(stockcode)
                     if current_holdings >= MAX_POSITIONS:
                         break
-                    if stockcode in self.positions or stockcode in sold_today:
+                    if self._is_position_or_pending(stockcode) or stockcode in sold_today:
                         continue
                     if stockcode not in hist_prices:
                         continue
@@ -942,10 +1016,10 @@ class Strategy:
                     success, order_id = self.trader.buy(stockcode, buy_volume)
                     if success:
                         self._record_pending_order('buy', stockcode, buy_volume, order_id, current_date)
-                        confirmed, outcome = self._confirm_buy_and_sync(stockcode, buy_volume, order_id, current_date)
+                        confirmed, outcome, filled_volume = self._confirm_buy_and_sync(stockcode, buy_volume, order_id, current_date)
                         if confirmed and stockcode in self.positions:
-                            available_cash -= buy_volume * current_price
-                            current_holdings += 1
+                            available_cash -= max(filled_volume, 0) * current_price
+                            current_holdings = self._occupied_slots()
                             _log('[{0}] >> 买入确认: {1} | {2}股 @ {3:.2f} | {4}'.format(
                                 current_date, stockcode, buy_volume, current_price, outcome))
                         else:
@@ -967,12 +1041,13 @@ class Strategy:
         if not asset:
             return
         total_assets, available_cash = asset[0], asset[1]
-        current_holdings = len(self.positions)
+        current_holdings = self._occupied_slots()
 
         for stockcode, s in scored:
+            stockcode = normalize_stock_code(stockcode)
             if current_holdings >= MAX_POSITIONS:
                 break
-            if stockcode in self.positions or stockcode in sold_today:
+            if self._is_position_or_pending(stockcode) or stockcode in sold_today:
                 continue
             if stockcode not in hist_prices or len(hist_prices[stockcode]) < 70:
                 continue
@@ -990,10 +1065,10 @@ class Strategy:
             success, order_id = self.trader.buy(stockcode, buy_volume)
             if success:
                 self._record_pending_order('buy', stockcode, buy_volume, order_id, current_date)
-                confirmed, outcome = self._confirm_buy_and_sync(stockcode, buy_volume, order_id, current_date)
+                confirmed, outcome, filled_volume = self._confirm_buy_and_sync(stockcode, buy_volume, order_id, current_date)
                 if confirmed and stockcode in self.positions:
-                    available_cash -= buy_volume * current_price
-                    current_holdings += 1
+                    available_cash -= max(filled_volume, 0) * current_price
+                    current_holdings = self._occupied_slots()
                     _log('[{0}] >> 补仓确认: {1} | {2}股 @ {3:.2f} | {4}'.format(
                         current_date, stockcode, buy_volume, current_price, outcome))
                 else:
@@ -1051,6 +1126,12 @@ def run_once():
     finally:
         trader.disconnect()
 
+def _next_weekday_morning(now):
+    days = 1
+    while (now + timedelta(days=days)).weekday() >= 5:
+        days += 1
+    return (now + timedelta(days=days)).replace(hour=9, minute=0, second=0, microsecond=0)
+
 def run_daemon():
     """守护模式: 每个交易日 14:55 自动执行"""
     _init_log()
@@ -1063,11 +1144,9 @@ def run_daemon():
         now = _now()
         # 周末不执行
         if now.weekday() >= 5:
-            _log('周末,休眠到周一')
-            next_monday = now + timedelta(days=7 - now.weekday())
-            next_time = next_monday.replace(hour=9, minute=0, second=0, microsecond=0)
-            sleep_sec = (next_time - now).total_seconds()
-            time.sleep(min(sleep_sec, 3600))  # 最多睡1小时,避免漂移
+            _log('周末,休眠到下个交易日上午')
+            sleep_sec = (_next_weekday_morning(now) - now).total_seconds()
+            time.sleep(max(30, sleep_sec))
             continue
 
         # 检查是否到了调度时间
@@ -1076,9 +1155,11 @@ def run_daemon():
         if now >= target_time:
             # 执行策略
             run_once()
-            # 执行完睡到明天
-            _log('执行完毕,休眠到明天')
-            time.sleep(3600)
+            # 执行完睡到下个交易日上午，避免过了调度时间后每小时重复重连
+            next_time = _next_weekday_morning(now)
+            sleep_sec = (next_time - now).total_seconds()
+            _log('执行完毕,休眠到 {0}'.format(next_time.strftime('%Y-%m-%d %H:%M:%S')))
+            time.sleep(max(30, sleep_sec))
         else:
             # 还没到时间,睡到调度时间前60秒
             sleep_sec = (target_time - now).total_seconds() - 60

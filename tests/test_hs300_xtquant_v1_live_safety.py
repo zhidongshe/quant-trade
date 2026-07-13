@@ -57,10 +57,11 @@ def test_strategy_records_pending_order_metadata():
 def test_confirm_buy_and_sync_uses_broker_positions_before_local_insert():
     strategy = Strategy(ConfirmingTrader())
 
-    ok, outcome = strategy._confirm_buy_and_sync('600000.SH', 1000, 'OID-1', '20260713')
+    ok, outcome, filled_volume = strategy._confirm_buy_and_sync('600000.SH', 1000, 'OID-1', '20260713')
 
     assert ok is True
     assert outcome == 'filled'
+    assert filled_volume == 1000
     assert strategy.positions['600000.SH'].volume == 1000
 
 class SellingTrader:
@@ -101,10 +102,11 @@ def test_confirm_sell_and_sync_keeps_local_position_until_broker_clears_it():
     strategy = Strategy(SellingTrader())
     strategy.positions['600000.SH'] = Position('600000.SH', 10.0, '20260701', 1000, 1)
 
-    ok, outcome = strategy._confirm_sell_and_sync('600000.SH', 1000, 'OID-2', '20260713')
+    ok, outcome, sold_volume = strategy._confirm_sell_and_sync('600000.SH', 1000, 'OID-2', '20260713')
 
     assert ok is True
     assert outcome == 'filled'
+    assert sold_volume == 1000
     assert '600000.SH' not in strategy.positions
 
 
@@ -134,4 +136,26 @@ def test_expire_stale_pending_orders_moves_old_entries_to_manual_review():
 
     assert strategy.state['pending_orders'] == {}
     assert strategy.state['stale_pending_orders'][0]['order_id'] == 'OID-STALE'
+
+
+def test_pending_buy_counts_as_occupied_slot_and_duplicate_guard():
+    strategy = Strategy(StaticTrader())
+    strategy._record_pending_order('buy', '600000', 1000, 'OID-PENDING', '20260713')
+
+    assert strategy._occupied_slots() == 1
+    assert strategy._is_position_or_pending('600000.SH') is True
+
+
+def test_sync_positions_normalizes_broker_codes():
+    class BareCodeTrader:
+        def get_asset(self):
+            return (100000.0, 50000.0, 50000.0, 0.0)
+
+        def get_positions(self):
+            return {'600000': {'volume': 1000, 'can_use': 1000, 'open_price': 10.0, 'market_value': 10000.0}}
+
+    strategy = Strategy(BareCodeTrader())
+
+    assert '600000.SH' in strategy.positions
+    assert '600000' not in strategy.positions
 

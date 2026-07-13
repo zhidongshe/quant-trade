@@ -17,9 +17,12 @@ def resolve_runtime_value(raw: str | None, default: str) -> str:
     return value or default
 
 
-def validate_schedule_time(value: str) -> str:
+def validate_schedule_time(value: str, default: str = '14:55') -> str:
     if not re.fullmatch(r'\d{2}:\d{2}', value):
-        raise ValueError(f'invalid schedule time: {value}')
+        return default
+    hour, minute = value.split(':')
+    if int(hour) > 23 or int(minute) > 59:
+        return default
     return value
 
 

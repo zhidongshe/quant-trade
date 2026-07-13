@@ -34,3 +34,11 @@ def test_state_and_log_paths_use_config_dirs(tmp_path):
     assert str(tmp_path / 'state') in state_path
     assert log_path.endswith('量化日志_xtquant_20260713_145500.log')
     assert str(tmp_path / 'logs') in log_path
+
+
+def test_invalid_schedule_time_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv('HS300_SCHEDULE_TIME', 'bad-time')
+
+    cfg = load_live_config()
+
+    assert cfg.schedule_time == '14:55'

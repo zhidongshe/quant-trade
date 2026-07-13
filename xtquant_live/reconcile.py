@@ -28,3 +28,11 @@ def classify_sell_outcome(code: str, requested_volume: int, before_positions: di
     if delta > 0:
         return 'partial'
     return 'unchanged'
+
+
+def volume_delta_after_buy(code: str, before_positions: dict, after_positions: dict) -> int:
+    return max(0, _volume_of(after_positions, code) - _volume_of(before_positions, code))
+
+
+def volume_delta_after_sell(code: str, before_positions: dict, after_positions: dict) -> int:
+    return max(0, _volume_of(before_positions, code) - _volume_of(after_positions, code))
