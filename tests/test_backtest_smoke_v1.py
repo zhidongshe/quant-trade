@@ -1,10 +1,16 @@
 import os
 import pandas as pd
 import pytest
+import hs300_xtquant_v1
 from backtest_v1 import main
 
 V1_EXISTS = os.path.exists('hs300_trend_strategy_single_file_v1.py')
 DATA_EXISTS = os.path.isdir('300data/data_a') and os.path.isdir('300data/data_a_5m')
+
+
+def test_live_config_is_loaded_for_entrypoint_smoke():
+    assert hs300_xtquant_v1.LIVE_CONFIG.account_id
+    assert hs300_xtquant_v1.LIVE_CONFIG.qmt_path
 
 @pytest.mark.skipif(not (V1_EXISTS and DATA_EXISTS), reason='缺 v1 或 300data')
 def test_smoke_recent_3_months(tmp_path):

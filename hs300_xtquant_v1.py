@@ -238,10 +238,16 @@ def calculate_buy_amount(total_assets, available_cash):
 
 # ==================== xtquant 交易层 (替代 passorder) ====================
 
-from xtquant.xttrader import XtQuantTrader
-from xtquant.xttype import StockAccount
-from xtquant import xtdata
-from xtquant import xtconstant
+try:
+    from xtquant.xttrader import XtQuantTrader
+    from xtquant.xttype import StockAccount
+    from xtquant import xtdata
+    from xtquant import xtconstant
+except ImportError:
+    XtQuantTrader = None
+    StockAccount = None
+    xtdata = None
+    xtconstant = None
 
 class Trader:
     """封装 xtquant 交易接口,替代原版的 passorder + get_trade_detail_data"""

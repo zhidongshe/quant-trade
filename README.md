@@ -77,6 +77,21 @@ pytest tests/ -v
 
 当前测试状态：20 tests passing
 
+### hs300_xtquant_v1 supervised live trading configuration
+
+`hs300_xtquant_v1.py` now reads its live runtime settings from environment variables:
+
+- `HS300_ACCOUNT_ID` — broker account id
+- `HS300_QMT_PATH` — MiniQMT userdata path
+- `HS300_STATE_DIR` — directory for JSON strategy state
+- `HS300_LOG_DIR` — directory for strategy logs
+- `HS300_SCHEDULE_TIME` — daily execution time in `HH:MM`
+
+Behavioral safety rules:
+- local positions are updated only after broker-side confirmation or broker-position reconciliation
+- critical query uncertainty blocks new buys
+- stale pending orders are moved to manual review on the next trading day
+
 ## 风险提示
 
 1. 最大回撤5%是理想目标，极端行情下可能突破
