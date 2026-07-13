@@ -488,6 +488,8 @@ class Strategy:
         self.ranked_candidates = []
         self.daily_sold_records = []
         self.state = _load_state()
+        self.state.setdefault('pending_orders', {})
+        self.state.setdefault('manual_review_flags', [])
 
         # 从持久化恢复
         self.trading_day_index = int(self.state.get('trading_day_index', 0))
@@ -535,6 +537,20 @@ class Strategy:
             if code not in broker_pos:
                 _log('清除失效持仓: {0}'.format(code))
                 del self.positions[code]
+
+    def _record_pending_order(self, side, stockcode, volume, order_id, current_date):
+        key = '{0}:{1}'.format(side, stockcode)
+        self.state.setdefault('pending_orders', {})[key] = {
+            'side': side,
+            'stockcode': stockcode,
+            'volume': int(volume),
+            'order_id': str(order_id),
+            'trade_date': current_date,
+        }
+
+    def _clear_pending_order(self, side, stockcode):
+        key = '{0}:{1}'.format(side, stockcode)
+        self.state.setdefault('pending_orders', {}).pop(key, None)
 
     def _check_market_trend(self, idx_prices):
         """判断大盘是否在上升趋势"""
