@@ -89,6 +89,14 @@ class NoAssetTrader:
         return []
 
 
+class StaticTrader:
+    def get_asset(self):
+        return (100000.0, 50000.0, 50000.0, 0.0)
+
+    def get_positions(self):
+        return {}
+
+
 def test_confirm_sell_and_sync_keeps_local_position_until_broker_clears_it():
     strategy = Strategy(SellingTrader())
     strategy.positions['600000.SH'] = Position('600000.SH', 10.0, '20260701', 1000, 1)
@@ -108,4 +116,22 @@ def test_strategy_marks_buy_block_reason_when_asset_unavailable():
 
     assert allowed is False
     assert strategy.state['buy_block_reason'] == 'asset_unavailable'
+
+
+def test_expire_stale_pending_orders_moves_old_entries_to_manual_review():
+    strategy = Strategy(StaticTrader())
+    strategy.state['pending_orders'] = {
+        'buy:600000.SH': {
+            'side': 'buy',
+            'stockcode': '600000.SH',
+            'volume': 1000,
+            'order_id': 'OID-STALE',
+            'trade_date': '20260712',
+        }
+    }
+
+    strategy._expire_stale_pending_orders('20260713')
+
+    assert strategy.state['pending_orders'] == {}
+    assert strategy.state['stale_pending_orders'][0]['order_id'] == 'OID-STALE'
 

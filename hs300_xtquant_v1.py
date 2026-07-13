@@ -492,6 +492,7 @@ class Strategy:
         self.state = _load_state()
         self.state.setdefault('pending_orders', {})
         self.state.setdefault('manual_review_flags', [])
+        self.state.setdefault('stale_pending_orders', [])
 
         # 从持久化恢复
         self.trading_day_index = int(self.state.get('trading_day_index', 0))
@@ -600,6 +601,13 @@ class Strategy:
         self.state['buy_block_reason'] = reason
         return allowed
 
+    def _expire_stale_pending_orders(self, current_date):
+        pending = self.state.setdefault('pending_orders', {})
+        stale_bucket = self.state.setdefault('stale_pending_orders', [])
+        stale_keys = [key for key, value in pending.items() if value.get('trade_date') != current_date]
+        for key in stale_keys:
+            stale_bucket.append(pending.pop(key))
+
     def _check_market_trend(self, idx_prices):
         """判断大盘是否在上升趋势"""
         if idx_prices is None or len(idx_prices) < 20:
@@ -645,6 +653,7 @@ class Strategy:
         """执行一次策略(相当于原版的 handlebar)"""
         self._crash_day = False  # 重置暴跌标志
         current_date = _now().strftime('%Y%m%d')
+        self._expire_stale_pending_orders(current_date)
         current_time = _now().strftime('%H:%M:%S')
 
         _log('[{0}] {1} 策略启动'.format(current_date, current_time))
