@@ -31,6 +31,7 @@ import numpy as np
 from datetime import datetime, timedelta
 
 from xtquant_live.config import load_live_config
+from xtquant_live.guards import guard_can_continue_cycle, guard_can_open_new_positions
 from xtquant_live.reconcile import classify_buy_outcome, classify_sell_outcome
 from xtquant_live.state_paths import build_log_file_path, build_state_file_path
 
@@ -589,6 +590,16 @@ class Strategy:
         })
         return False, outcome
 
+    def _can_continue_cycle(self):
+        allowed, reason = guard_can_continue_cycle(self.trader.get_asset(), self.trader.get_positions())
+        self.state['cycle_guard_reason'] = reason
+        return allowed
+
+    def _can_open_new_positions(self, history_ok):
+        allowed, reason = guard_can_open_new_positions(self.trader.get_asset(), self.trader.get_positions(), history_ok)
+        self.state['buy_block_reason'] = reason
+        return allowed
+
     def _check_market_trend(self, idx_prices):
         """判断大盘是否在上升趋势"""
         if idx_prices is None or len(idx_prices) < 20:
@@ -645,6 +656,10 @@ class Strategy:
 
         # 更新 broker 持仓
         self._sync_positions()
+        if not self._can_continue_cycle():
+            _log('[{0}] 关键查询失败，终止本轮执行'.format(current_date))
+            self._save_and_exit(current_date)
+            return
 
         # 交易日计数 + 换仓日判断
         self.trading_day_index += 1
@@ -889,7 +904,8 @@ class Strategy:
                     current_date, stockcode, order_id, outcome))
 
         # 换仓买入
-        if self.market_ok_streak >= 2 and market_ok and not self._crash_day:
+        can_open_new = self._can_open_new_positions(history_ok=bool(hist_prices))
+        if self.market_ok_streak >= 2 and market_ok and not self._crash_day and can_open_new:
             asset = self.trader.get_asset()
             if asset:
                 total_assets, available_cash = asset[0], asset[1]
@@ -927,6 +943,9 @@ class Strategy:
         """非换仓日补仓"""
         if not (self.market_ok_streak >= 2 and market_ok) or self._crash_day:
             _log('[{0}] 大盘弱势或暴跌日,非换仓日跳过补仓'.format(current_date))
+            return
+        if not self._can_open_new_positions(history_ok=bool(hist_prices)):
+            _log('[{0}] 禁止新开仓: {1}'.format(current_date, self.state.get('buy_block_reason', 'unknown')))
             return
 
         asset = self.trader.get_asset()

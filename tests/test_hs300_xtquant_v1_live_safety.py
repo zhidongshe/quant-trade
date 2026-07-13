@@ -78,6 +78,17 @@ class SellingTrader:
         return True
 
 
+class NoAssetTrader:
+    def get_asset(self):
+        return None
+
+    def get_positions(self):
+        return {}
+
+    def get_sector(self, sector_code):
+        return []
+
+
 def test_confirm_sell_and_sync_keeps_local_position_until_broker_clears_it():
     strategy = Strategy(SellingTrader())
     strategy.positions['600000.SH'] = Position('600000.SH', 10.0, '20260701', 1000, 1)
@@ -87,4 +98,14 @@ def test_confirm_sell_and_sync_keeps_local_position_until_broker_clears_it():
     assert ok is True
     assert outcome == 'filled'
     assert '600000.SH' not in strategy.positions
+
+
+def test_strategy_marks_buy_block_reason_when_asset_unavailable():
+    strategy = Strategy(NoAssetTrader())
+    strategy.state['buy_block_reason'] = ''
+
+    allowed = strategy._can_open_new_positions(history_ok=True)
+
+    assert allowed is False
+    assert strategy.state['buy_block_reason'] == 'asset_unavailable'
 
