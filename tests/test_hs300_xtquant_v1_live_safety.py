@@ -46,6 +46,34 @@ class ConfirmingTrader:
         return True
 
 
+class StaleConfirmingTrader:
+    def get_asset(self):
+        return (100000.0, 50000.0, 50000.0, 0.0)
+
+    def get_positions(self):
+        return {}
+
+    def wait_order_filled(self, order_id, timeout=10):
+        return True
+
+
+class ImmediateFillTrader:
+    def __init__(self):
+        self._positions = {}
+
+    def get_asset(self):
+        return (100000.0, 50000.0, 50000.0, 0.0)
+
+    def get_positions(self):
+        return self._positions
+
+    def buy(self):
+        self._positions = {'600000.SH': {'volume': 1000, 'can_use': 1000, 'open_price': 10.0, 'market_value': 10000.0}}
+
+    def wait_order_filled(self, order_id, timeout=10):
+        return True
+
+
 def test_strategy_records_pending_order_metadata():
     strategy = Strategy(DummyTrader())
     strategy._record_pending_order('buy', '600000.SH', 1000, 'OID-1', '20260713')
@@ -64,6 +92,32 @@ def test_confirm_buy_and_sync_uses_broker_positions_before_local_insert():
     assert filled_volume == 1000
     assert strategy.positions['600000.SH'].volume == 1000
 
+
+def test_buy_confirmation_does_not_clear_pending_when_broker_position_is_stale():
+    strategy = Strategy(StaleConfirmingTrader())
+    strategy._record_pending_order('buy', '600000.SH', 1000, 'OID-STALE', '20260713')
+
+    ok, outcome, filled_volume = strategy._confirm_buy_and_sync('600000.SH', 1000, 'OID-STALE', '20260713')
+
+    assert ok is False
+    assert outcome in ('missing_before', 'unchanged')
+    assert filled_volume == 0
+    assert 'buy:600000.SH' in strategy.state['pending_orders']
+
+
+def test_confirm_buy_uses_pre_order_snapshot_for_immediate_fills():
+    trader = ImmediateFillTrader()
+    strategy = Strategy(trader)
+    before_positions = trader.get_positions()
+    trader.buy()
+
+    ok, outcome, filled_volume = strategy._confirm_buy_and_sync(
+        '600000.SH', 1000, 'OID-IMM', '20260713', before_positions=before_positions)
+
+    assert ok is True
+    assert outcome == 'filled'
+    assert filled_volume == 1000
+
 class SellingTrader:
     def __init__(self):
         self._positions = {'600000.SH': {'volume': 1000, 'can_use': 1000, 'open_price': 10.0, 'market_value': 10000.0}}
@@ -77,6 +131,21 @@ class SellingTrader:
     def wait_order_filled(self, order_id, timeout=10):
         self._positions = {}
         return True
+
+
+class PartialSellingTrader:
+    def __init__(self):
+        self._positions = {'600000.SH': {'volume': 1000, 'can_use': 1000, 'open_price': 10.0, 'market_value': 10000.0}}
+
+    def get_asset(self):
+        return (100000.0, 50000.0, 50000.0, 0.0)
+
+    def get_positions(self):
+        return self._positions
+
+    def wait_order_filled(self, order_id, timeout=10):
+        self._positions = {'600000.SH': {'volume': 500, 'can_use': 500, 'open_price': 10.0, 'market_value': 5000.0}}
+        return False
 
 
 class NoAssetTrader:
@@ -108,6 +177,18 @@ def test_confirm_sell_and_sync_keeps_local_position_until_broker_clears_it():
     assert outcome == 'filled'
     assert sold_volume == 1000
     assert '600000.SH' not in strategy.positions
+
+
+def test_confirm_sell_and_sync_reports_partial_fill_with_residual_position():
+    strategy = Strategy(PartialSellingTrader())
+    strategy.positions['600000.SH'] = Position('600000.SH', 10.0, '20260701', 1000, 1)
+
+    ok, outcome, sold_volume = strategy._confirm_sell_and_sync('600000.SH', 1000, 'OID-PART', '20260713')
+
+    assert ok is True
+    assert outcome == 'partial'
+    assert sold_volume == 500
+    assert strategy.positions['600000.SH'].volume == 500
 
 
 def test_strategy_marks_buy_block_reason_when_asset_unavailable():
