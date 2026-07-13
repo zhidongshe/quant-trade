@@ -31,6 +31,7 @@ import numpy as np
 from datetime import datetime, timedelta
 
 from xtquant_live.config import load_live_config
+from xtquant_live.state_paths import build_log_file_path, build_state_file_path
 
 # 当前时间函数(实盘用datetime.now,回测由外部注入)
 _now = datetime.now
@@ -72,7 +73,7 @@ _LOG_FILE_PATH = None
 def _init_log():
     global _LOG_FILE_PATH
     ts = _now().strftime('%Y%m%d_%H%M%S')
-    _LOG_FILE_PATH = r'c:\量化日志_xtquant_{0}.log'.format(ts)
+    _LOG_FILE_PATH = build_log_file_path(LIVE_CONFIG, ts)
 
 def _log(msg):
     timestamp = _now().strftime('%Y-%m-%d %H:%M:%S')
@@ -88,7 +89,7 @@ def _log(msg):
 
 # ==================== 状态持久化 ====================
 
-_STATE_FILE_PATH = r'c:\hs300_xtquant_{0}_state.json'.format(ACCOUNT_ID)
+_STATE_FILE_PATH = build_state_file_path(LIVE_CONFIG)
 
 def _load_state():
     if not os.path.exists(_STATE_FILE_PATH):
