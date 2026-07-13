@@ -31,7 +31,7 @@ import numpy as np
 from datetime import datetime, timedelta
 
 from xtquant_live.config import load_live_config
-from xtquant_live.reconcile import classify_buy_outcome
+from xtquant_live.reconcile import classify_buy_outcome, classify_sell_outcome
 from xtquant_live.state_paths import build_log_file_path, build_state_file_path
 
 # 当前时间函数(实盘用datetime.now,回测由外部注入)
@@ -571,6 +571,24 @@ class Strategy:
         })
         return False, outcome
 
+    def _confirm_sell_and_sync(self, stockcode, requested_volume, order_id, current_date):
+        before_positions = self.trader.get_positions() or {}
+        filled = self.trader.wait_order_filled(order_id, timeout=ORDER_CONFIRM_TIMEOUT)
+        after_positions = self.trader.get_positions() or {}
+        outcome = classify_sell_outcome(stockcode, requested_volume, before_positions, after_positions)
+        self._sync_positions()
+        if filled or outcome in ('filled', 'partial'):
+            self._clear_pending_order('sell', stockcode)
+            return True, outcome
+        self.state.setdefault('manual_review_flags', []).append({
+            'side': 'sell',
+            'stockcode': stockcode,
+            'order_id': str(order_id),
+            'trade_date': current_date,
+            'outcome': outcome,
+        })
+        return False, outcome
+
     def _check_market_trend(self, idx_prices):
         """判断大盘是否在上升趋势"""
         if idx_prices is None or len(idx_prices) < 20:
@@ -756,21 +774,24 @@ class Strategy:
                     current_date, stockcode, order_id))
                 continue
 
-            # 成交后才变更状态 (回测里 buy/sell 是同步撮合, success 即已成交)
-            sell_price = float(hist_prices[stockcode][-1]) if stockcode in hist_prices else pos.buy_price
-            realized = (sell_price - pos.buy_price) * pos.volume
-            _log('[{0}] << 卖出成交: {1} | {2}股 | 原因: {3} | 盈亏: {4:+.0f}元'.format(
-                current_date, stockcode, pos.volume, reason, realized))
-            self.daily_sold_records.append({
-                'stockcode': stockcode, 'volume': pos.volume,
-                'buy_price': pos.buy_price, 'sell_price': sell_price,
-                'reason': reason, 'buy_date': pos.buy_date,
-            })
-            del self.positions[stockcode]
-            sold_today.add(stockcode)
-            # 暴跌当日禁止再买(不接飞刀)
-            if reason == 'crash_protection':
-                self._crash_day = True
+            self._record_pending_order('sell', stockcode, pos.volume, order_id, current_date)
+            confirmed, outcome = self._confirm_sell_and_sync(stockcode, pos.volume, order_id, current_date)
+            if confirmed and stockcode not in self.positions:
+                sell_price = float(hist_prices[stockcode][-1]) if stockcode in hist_prices else pos.buy_price
+                realized = (sell_price - pos.buy_price) * pos.volume
+                _log('[{0}] << 卖出确认: {1} | {2}股 | 原因: {3} | 盈亏: {4:+.0f}元 | {5}'.format(
+                    current_date, stockcode, pos.volume, reason, realized, outcome))
+                self.daily_sold_records.append({
+                    'stockcode': stockcode, 'volume': pos.volume,
+                    'buy_price': pos.buy_price, 'sell_price': sell_price,
+                    'reason': reason, 'buy_date': pos.buy_date,
+                })
+                sold_today.add(stockcode)
+                if reason == 'crash_protection':
+                    self._crash_day = True
+            else:
+                _log('[{0}] !! 卖出待人工检查: {1} | order_id={2} | {3}'.format(
+                    current_date, stockcode, order_id, outcome))
 
         # 5. 打分(过滤涨停票)
         candidates = []
@@ -858,9 +879,14 @@ class Strategy:
             if not success:
                 _log('[{0}] !! 换仓卖出被拒: {1}'.format(current_date, stockcode))
                 continue
-            _log('[{0}] 换仓卖出成交: {1}'.format(current_date, stockcode))
-            del self.positions[stockcode]
-            sold_today.add(stockcode)
+            self._record_pending_order('sell', stockcode, pos.volume, order_id, current_date)
+            confirmed, outcome = self._confirm_sell_and_sync(stockcode, pos.volume, order_id, current_date)
+            if confirmed and stockcode not in self.positions:
+                _log('[{0}] 换仓卖出确认: {1} | {2}'.format(current_date, stockcode, outcome))
+                sold_today.add(stockcode)
+            else:
+                _log('[{0}] !! 换仓卖出待人工检查: {1} | order_id={2} | {3}'.format(
+                    current_date, stockcode, order_id, outcome))
 
         # 换仓买入
         if self.market_ok_streak >= 2 and market_ok and not self._crash_day:

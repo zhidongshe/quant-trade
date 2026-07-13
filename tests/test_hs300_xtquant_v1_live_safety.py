@@ -20,7 +20,7 @@ sys.modules.setdefault('xtquant.xttype', xttype)
 sys.modules.setdefault('xtquant.xtdata', xtdata)
 sys.modules.setdefault('xtquant.xtconstant', xtconstant)
 
-from hs300_xtquant_v1 import Strategy
+from hs300_xtquant_v1 import Strategy, Position
 
 
 class DummyTrader:
@@ -62,3 +62,29 @@ def test_confirm_buy_and_sync_uses_broker_positions_before_local_insert():
     assert ok is True
     assert outcome == 'filled'
     assert strategy.positions['600000.SH'].volume == 1000
+
+class SellingTrader:
+    def __init__(self):
+        self._positions = {'600000.SH': {'volume': 1000, 'can_use': 1000, 'open_price': 10.0, 'market_value': 10000.0}}
+
+    def get_asset(self):
+        return (100000.0, 50000.0, 50000.0, 0.0)
+
+    def get_positions(self):
+        return self._positions
+
+    def wait_order_filled(self, order_id, timeout=10):
+        self._positions = {}
+        return True
+
+
+def test_confirm_sell_and_sync_keeps_local_position_until_broker_clears_it():
+    strategy = Strategy(SellingTrader())
+    strategy.positions['600000.SH'] = Position('600000.SH', 10.0, '20260701', 1000, 1)
+
+    ok, outcome = strategy._confirm_sell_and_sync('600000.SH', 1000, 'OID-2', '20260713')
+
+    assert ok is True
+    assert outcome == 'filled'
+    assert '600000.SH' not in strategy.positions
+
